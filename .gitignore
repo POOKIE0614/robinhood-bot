@@ -1,0 +1,23 @@
+# Environment variables & secrets (CRITICAL)
+.env
+.env.local
+.env.*.local
+
+# Telegram session files (CRITICAL - contains auth tokens)
+*.session
+*.session-journal
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+cache/
+
+# Logs
+logs/
+*.log
+
+# Virtual environments
+venv/
+env/
+.venv/
