@@ -486,6 +486,34 @@ class DexTrader:
             self._route_cache[token_cs] = result
         return result
 
+    def _v4_params_for(self, token_address: str, quote_asset: str, fee: int):
+        token_cs = self.w3.to_checksum_address(token_address)
+        cached = self._v4_pool_params_cache.get(token_cs, {})
+        tick = cached.get("tick", -1)
+        hook = cached.get("hook") or ZERO
+        fee_out = fee if fee is not None and int(fee) >= 0 else cached.get("fee", -1)
+        if cached.get("unresolved_key") or tick is None or int(tick) < 0 or int(fee_out) < 0:
+            try:
+                probed = self.stock_v4.probe_v4_key(token_cs, quote_asset)
+            except Exception:
+                probed = None
+            if probed:
+                tick, hook, fee_out = probed["tick"], probed["hook"], probed["fee"]
+                self._v4_pool_params_cache[token_cs] = {
+                    "tick": tick, "hook": hook, "fee": fee_out, "quote": quote_asset
+                }
+            else:
+                q = (quote_asset or ZERO).lower()
+                if q in (self.weth_address.lower(), ZERO.lower()):
+                    fee_out = 3000 if int(fee_out) < 0 else fee_out
+                    tick = 60 if int(tick) < 0 else tick
+                    hook = ZERO
+                else:
+                    fee_out = 0 if int(fee_out) < 0 else fee_out
+                    tick = 200 if int(tick) < 0 else tick
+                    hook = PONS_V2_HOOK
+        return int(fee_out), int(tick), hook
+
     async def _detect_venue_and_route_uncached(self, token_address: str) -> Tuple[str, str, str, int]:
         """
         Fast Decision Tree (Stops immediately on first valid match):
@@ -981,8 +1009,15 @@ class DexTrader:
         print(f"🔎 Token: {token_address} | Venue: {venue} | Target: {target_addr} | QuoteAsset: {quote_asset} | Fee: {fee}")
 
         if venue == "NONE":
-            # Check Stock / V4 Router fallback
-            info = await asyncio.to_thread(self.stock_v4.detect, token_address)
+            info = {}
+            try:
+                info = await asyncio.wait_for(
+                    asyncio.to_thread(self.stock_v4.detect, token_address),
+                    timeout=8.0,
+                )
+            except Exception as e:
+                logger.warning(f"stock_v4.detect skipped/timed out: {e}")
+                info = {}
             if info.get("venue") != "NONE":
                 venue = info["venue"]
                 quote_asset = info.get("quote", ZERO)
@@ -1012,19 +1047,26 @@ class DexTrader:
                     logger.warning(f"stock_v4 skip {token_address} {e}")
                     tx_hash = None
 
-                # If stock_v4.buy returned None and it's a V4 ERC20-quoted token, invoke buy_stock_two_tx directly
                 if not tx_hash and venue == "UNISWAP_V4" and quote_asset.lower() not in (self.weth_address.lower(), ZERO.lower(), "0x0000000000000000000000000000000000000000"):
+                    v4_tick = info.get("tick", 200)
+                    v4_hook = info.get("hook", PONS_V2_HOOK)
+                    v4_fee = fee if fee is not None and int(fee) >= 0 else 0
                     try:
-                        v4_tick = info.get("tick", 200)
-                        v4_hook = info.get("hook", PONS_V2_HOOK)
-                        res = await asyncio.to_thread(
-                            self.stock_v4.buy_stock_two_tx,
-                            token_address, quote_asset, eth_amount,
-                            fee if fee else 0, v4_tick, v4_hook
-                        )
+                        if quote_asset.lower() == self.usdg_address.lower():
+                            logger.info(f"USDG V4 two-tx buy for {token_address} fee={v4_fee} tick={v4_tick}")
+                            res = await asyncio.to_thread(
+                                self.stock_v4.buy_usdg_two_tx,
+                                token_address, eth_amount, v4_fee, v4_tick, v4_hook
+                            )
+                        else:
+                            res = await asyncio.to_thread(
+                                self.stock_v4.buy_stock_two_tx,
+                                token_address, quote_asset, eth_amount,
+                                v4_fee, v4_tick, v4_hook
+                            )
                         tx_hash = res[1] if isinstance(res, tuple) else res
                     except Exception as e:
-                        logger.error(f"Fallback buy_stock_two_tx failed for {token_address}: {e}")
+                        logger.error(f"Fallback two-tx buy failed for {token_address} quote={quote_asset}: {e}")
 
                 if tx_hash:
                     receipt = await self.chain.wait_for_receipt(tx_hash)
@@ -1077,10 +1119,26 @@ class DexTrader:
             v4_hook = cached_params.get("hook", default_hook)
 
             if quote_asset.lower() == self.usdg_address.lower():
-                # Use detected fee/tick/hook for the second hop if available
+                # Prefer two-tx ETH->USDG->token to avoid 0x3b99b53d hybrid encode
+                try:
+                    if not getattr(self.config, "DRY_RUN", True):
+                        bal_before = await self.chain.get_token_balance(token_address)
+                        res = await asyncio.to_thread(
+                            self.stock_v4.buy_usdg_two_tx,
+                            token_address, eth_amount, fee if fee is not None else 3000, v4_tick, v4_hook
+                        )
+                        tx2 = res[1] if isinstance(res, tuple) else res
+                        if tx2:
+                            receipt = await self.chain.wait_for_receipt(tx2)
+                            bal_after = await self.chain.get_token_balance(token_address)
+                            got = bal_after - bal_before
+                            if receipt.get("status", 0) == 1 and got > 0:
+                                return tx2, got
+                except Exception as e:
+                    logger.warning(f"buy_usdg_two_tx failed, falling back to encoded 2hop: {e}")
                 tx, cmd = self.build_v4_usdg_2hop_tx(
                     token_address, eth_wei, min_out, recipient,
-                    fee2=fee if fee else 3000,
+                    fee2=fee if fee is not None and int(fee) >= 0 else 3000,
                     tick2=v4_tick,
                     hook2=v4_hook
                 )
@@ -1322,6 +1380,7 @@ class DexTrader:
         return "", 0.0
 
     async def sell_token(self, token_address: str, token_amount: float, slippage_pct: float = 15.0) -> Tuple[str, float]:
+        self.w3 = self.chain.w3
         await self.verify_chain_id()
         token_address = self.w3.to_checksum_address(token_address)
         recipient = self.chain.account.address if self.chain.account else "0x" + "0"*40
@@ -1347,34 +1406,31 @@ class DexTrader:
         min_out = 1
 
         if venue in ("UNISWAP_V4", "NONE"):
-            # If WETH/Native quote, first try StockV4Router.sell()
-            if quote_asset.lower() in (self.weth_address.lower(), ZERO.lower(), "0x0000000000000000000000000000000000000000"):
-                try:
-                    bal_before = await self.chain.get_token_balance(token_address)
-                    tx = await asyncio.to_thread(self.stock_v4.sell, token_address, amount_in)
-                    if tx:
-                        receipt = await self.chain.wait_for_receipt(tx)
-                        bal_after = await self.chain.get_token_balance(token_address)
-                        tokens_sold = bal_before - bal_after
-                        status = receipt.get("status", 0)
-                        if status == 1 and tokens_sold > 0:
-                            return tx, tokens_sold
-                except Exception as e:
-                    logger.warning(f"V4 stock_v4.sell failed: {e}, falling back to direct router sell")
+            v4_fee, v4_tick, v4_hook = self._v4_params_for(token_address, quote_asset, fee)
+            try:
+                bal_before = await self.chain.get_token_balance(token_address)
+                live_raw = int(bal_before * (10 ** decimals))
+                if live_raw > 0:
+                    amount_in = min(amount_in, live_raw)
+                txh = await asyncio.to_thread(
+                    self.stock_v4.sell_to_eth,
+                    token_address, amount_in, v4_fee, v4_tick, v4_hook, quote_asset
+                )
+                if txh:
+                    receipt = await self.chain.wait_for_receipt(txh)
+                    bal_after = await self.chain.get_token_balance(token_address)
+                    tokens_sold = bal_before - bal_after
+                    if receipt.get("status", 0) == 1 and tokens_sold > 0:
+                        logger.info(f"✅ V4/stock sell filled: {tokens_sold:.4f} tokens tx={txh}")
+                        return txh, tokens_sold
+            except Exception as e:
+                logger.warning(f"sell_to_eth failed ({venue} quote={quote_asset}): {e}")
 
-            # Direct V4 Sell via Universal Router with Permit2
             try:
                 await asyncio.to_thread(self.stock_v4.ensure_permit2, token_address, amount_in)
-                cached_params = self._v4_pool_params_cache.get(token_address, {})
-                default_tick = 200 if quote_asset.lower() != self.weth_address.lower() else 60
-                default_hook = PONS_V2_HOOK if quote_asset.lower() != self.weth_address.lower() else ("0x" + "0"*40)
-                v4_tick = cached_params.get("tick", default_tick)
-                v4_hook = cached_params.get("hook", default_hook)
-                v4_fee = fee if fee else 3000
-
                 tx_v4, cmd_v4 = self.build_v4_sell_tx(
                     token_address, amount_in, min_out, recipient, quote_asset,
-                    fee=v4_fee, tick=v4_tick, hook=v4_hook
+                    fee=v4_fee if v4_fee >= 0 else 0, tick=v4_tick if v4_tick > 0 else 200, hook=v4_hook
                 )
                 tx = tx_v4
                 spender = self.uni_router_address
@@ -1634,7 +1690,7 @@ class DexTrader:
                     elif q_cs.lower() == self.usdg_address.lower():
                         eth_price_usd = await self.chain.get_eth_price_usd()
                         return price_in_quote / eth_price_usd if eth_price_usd > 0 else 0.0
-                    elif q_cs in EXTENDED_STOCK_LIST:
+                    elif True:  # any non-ETH/USDG V4 quote (HOOD/UPS/TTWO/...)
                         stock_pool = await asyncio.to_thread(self.v3_factory.functions.getPool(q_cs, self.usdg_address, 500).call)
                         if stock_pool and stock_pool != ZERO:
                             sp_contract = self.w3.eth.contract(address=stock_pool, abi=[

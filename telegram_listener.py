@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import Callable, Awaitable, Optional
 
 from telethon import TelegramClient, events, errors
@@ -41,8 +42,10 @@ class TelegramListener:
         
         # Instantiate TelegramClient in the active running event loop
         if self.client is None:
+            session_dir = getattr(self.config, "BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
+            session_path = os.path.join(session_dir, "robinhood_copy_trader_session")
             self.client = TelegramClient(
-                'robinhood_copy_trader_session',
+                session_path,
                 self.config.TELEGRAM_API_ID,
                 self.config.TELEGRAM_API_HASH,
                 connection_retries=None,

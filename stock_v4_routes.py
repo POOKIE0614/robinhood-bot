@@ -47,6 +47,7 @@ STOCK_TOKENS = {
     "MSTR": "0xec262a75e413fAfD0dF80480274532C79D42da09",
     "HOOD": "0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa",
     "SPCX": "0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa",
+    "UPS":  "0xf23250dac154D05Bb671CB0d0eBEf3c635c79CE2",
 }
 STOCK_LIST = [to_checksum_address(a) for a in STOCK_TOKENS.values()]
 QUOTE_TOKENS = [NATIVE, WETH, USDG] + STOCK_LIST
@@ -55,8 +56,12 @@ STOCK_SKIP = {a.lower() for a in STOCK_LIST}
 
 V3_FEES = [100, 500, 3000, 10000]
 V4_FEE_TICKS = [
+    (0, 200), (0, 60), (0, 1),  # Pons / Bags graduated V4
     (100, 1), (500, 10), (2500, 25), (3000, 60), (10000, 200),
     (50, 1), (50000, 5), (900000, 90), (950000, 95),
+]
+V4_FEE_TICKS_EXTENDED = V4_FEE_TICKS + [
+    (0, 200), (0, 60), (0, 1), (802731, 9303), (833690, 200), (43000, 430),
 ]
 V4_HOOKS = [
     to_checksum_address(ZERO),
@@ -153,7 +158,7 @@ def _cs(addr):
 
 def fetch_dexscreener(token: str):
     token = token.lower()
-    r = requests.get(DEXSCREENER + token, timeout=8)
+    r = requests.get(DEXSCREENER + token, timeout=3, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     pairs = r.json().get("pairs") or []
     rh = []
@@ -166,8 +171,6 @@ def fetch_dexscreener(token: str):
         if base != token and quote != token:
             continue
         liq = float(((p.get("liquidity") or {}).get("usd") or 0))
-        if liq <= 0:
-            continue
         rh.append((liq, p))
     if not rh:
         return None
@@ -791,6 +794,100 @@ class StockV4Router:
             int(token_fee), int(token_tick), hook
         )
         return tx1, tx2
+
+    def buy_usdg_two_tx(self, token: str, amount_eth: float, token_fee=3000, token_tick=60, token_hook=None):
+        token = _cs(token)
+        hook = token_hook or ZERO
+        amount_wei = self.w3.to_wei(amount_eth, "ether")
+        me = self.account.address
+        tx1 = self.buy_v3_multihop([WETH, USDG], [500], amount_wei, me, 1, 280000)
+        self.w3.eth.wait_for_transaction_receipt(tx1, timeout=60)
+        usdg_bal = self.w3.eth.contract(USDG, abi=ERC20_ABI).functions.balanceOf(me).call()
+        if usdg_bal <= 0:
+            raise RuntimeError(f"tx1 filled no USDG: {tx1}")
+        fee = int(token_fee) if token_fee is not None and int(token_fee) >= 0 else 2500
+        tick = int(token_tick) if token_tick and int(token_tick) > 0 else 25
+        tx2 = self.buy_v4_erc20_in(USDG, token, usdg_bal, 1, fee, tick, hook)
+        return tx1, tx2
+
+    def probe_v4_key(self, token: str, quote: str):
+        token, quote = _cs(token), (NATIVE if str(quote).lower() in (NATIVE.lower(), ZERO.lower()) else _cs(quote))
+        ticks = V4_FEE_TICKS_EXTENDED if "V4_FEE_TICKS_EXTENDED" in globals() else V4_FEE_TICKS
+        for fee, tick in ticks:
+            for hook in V4_HOOKS:
+                if self._v4_live(token, quote, fee, tick, hook):
+                    return {"fee": fee, "tick": tick, "hook": hook, "quote": quote}
+        return None
+
+    def _erc20_bal(self, token):
+        return self.w3.eth.contract(_cs(token), abi=ERC20_ABI).functions.balanceOf(self.account.address).call()
+
+    def sell_v3_path(self, path, fees, amount_in, min_out=1):
+        me = self.account.address
+        token_in = _cs(path[0])
+        erc = self.w3.eth.contract(token_in, abi=ERC20_ABI)
+        max_fee, prio = self._gas_fees()
+        if erc.functions.allowance(me, SWAP_ROUTER_02).call() < amount_in:
+            atx = erc.functions.approve(SWAP_ROUTER_02, 2**256 - 1).build_transaction({
+                "from": me, "gas": 80000,
+                "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
+                "nonce": self.w3.eth.get_transaction_count(me), "chainId": CHAIN_ID,
+            })
+            self.w3.eth.wait_for_transaction_receipt(self._send(atx), timeout=60)
+        raw = bytes.fromhex(_cs(path[0])[2:])
+        for fee, tok in zip(fees, path[1:]):
+            raw += int(fee).to_bytes(3, "big") + bytes.fromhex(_cs(tok)[2:])
+        tx = self.sr02.functions.exactInput((raw, me, int(amount_in), int(min_out))).build_transaction({
+            "from": me, "value": 0, "gas": 380000,
+            "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
+            "nonce": self.w3.eth.get_transaction_count(me), "chainId": CHAIN_ID,
+        })
+        return self._send(tx)
+
+    def sell_to_eth(self, token: str, amount_tokens: int, fee=0, tick=200, hook=None, quote=None):
+        token = _cs(token)
+        hook = hook or PONS_HOOK
+        quote = quote or WETH
+        qlow = str(quote).lower()
+        me = self.account.address
+        if qlow in (NATIVE.lower(), WETH.lower(), ZERO.lower()):
+            self.ensure_permit2(token, amount_tokens)
+            pull = eth_abi.encode(["address", "address", "uint160"], [token, UNIVERSAL_ROUTER, int(amount_tokens)])
+            v4 = make_v4_swap_input(token, WETH, amount_tokens, 1, int(fee), int(tick) if tick > 0 else 60, hook)
+            unwrap = eth_abi.encode(["address", "uint256"], [me, 1])
+            commands = bytes([0x02, 0x10, UNWRAP_WETH])
+            inputs = [pull, v4, unwrap]
+            max_fee, prio = self._gas_fees()
+            tx = self.ur.functions.execute(commands, inputs, int(time.time()) + 300).build_transaction({
+                "from": me, "value": 0, "gas": 500000,
+                "maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio,
+                "nonce": self.w3.eth.get_transaction_count(me), "chainId": CHAIN_ID,
+            })
+            try:
+                tx["gas"] = max(500000, int(self.w3.eth.estimate_gas(tx) * 1.2))
+            except Exception as e:
+                raise RuntimeError(f"V4 ETH sell estimate revert: {e}")
+            return self._send(tx)
+
+        tx1 = self.buy_v4_erc20_in(token, quote, amount_tokens, 1, int(fee), int(tick) if tick > 0 else 200, hook)
+        self.w3.eth.wait_for_transaction_receipt(tx1, timeout=60)
+        q_bal = self._erc20_bal(quote)
+        if q_bal <= 0:
+            raise RuntimeError(f"V4 sell hop filled no quote ({quote}): {tx1}")
+        if _cs(quote).lower() == USDG.lower():
+            return self.sell_v3_path([USDG, WETH], [500], q_bal)
+        stock = _cs(quote)
+        for f in V3_FEES:
+            if self._v3_pool(stock, WETH, f):
+                return self.sell_v3_path([stock, WETH], [f], q_bal)
+        stock_usdg = None
+        for f in V3_FEES:
+            if self._v3_pool(stock, USDG, f):
+                stock_usdg = f
+                break
+        if stock_usdg is not None:
+            return self.sell_v3_path([stock, USDG, WETH], [stock_usdg, 500], q_bal)
+        raise RuntimeError(f"No V3 path stock->ETH for {stock}")
 
     def ensure_permit2(self, token, amount):
         token = _cs(token)

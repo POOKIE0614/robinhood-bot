@@ -1,10 +1,10 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import aiohttp
 from web3 import Web3
-from web3.exceptions import Web3Exception, TransactionNotFound
+from web3.exceptions import TransactionNotFound
 
 logger = logging.getLogger("copytrader")
 
@@ -16,72 +16,101 @@ ERC20_ABI = [
     {"inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}
 ]
 
+DEFAULT_RPCS = [
+    "https://silent-clean-tent.robinhood-mainnet.quiknode.pro/fb9742dcdbac8e3afbacc17fc8859e433a719aa1/",
+    "https://robinhood-rpc.publicnode.com",
+    "https://4663.rpc.thirdweb.com",
+    "https://rpc.mainnet.chain.robinhood.com",
+]
+
+
 class ChainClient:
     def __init__(self, config):
         self.config = config
-        self.primary_rpc = getattr(self.config, 'RPC_URL', "https://silent-clean-tent.robinhood-mainnet.quiknode.pro/fb9742dcdbac8e3afbacc17fc8859e433a719aa1/")
-        self.wss_rpc = getattr(self.config, 'RPC_WSS_URL', "wss://silent-clean-tent.robinhood-mainnet.quiknode.pro/fb9742dcdbac8e3afbacc17fc8859e433a719aa1/")
-        self.fallback_rpc = getattr(self.config, 'FALLBACK_RPC_URL', "https://rpc.mainnet.chain.robinhood.com")
-        self.chain_id = int(getattr(self.config, 'CHAIN_ID', 4663))
-
-        self.w3 = Web3(Web3.HTTPProvider(
-            self.primary_rpc, 
-            request_kwargs={'timeout': 10}
-        ))
-        self.fallback_w3 = Web3(Web3.HTTPProvider(
-            self.fallback_rpc,
-            request_kwargs={'timeout': 10}
-        ))
-        
-        # Test connection & fallback if needed
-        try:
-            if not self.w3.is_connected():
-                logger.warning(f"Primary RPC unreachable, switching to fallback RPC: {self.fallback_rpc}")
-                self.w3 = self.fallback_w3
-        except Exception as e:
-            logger.warning(f"Error connecting to primary RPC ({e}), switching to fallback: {self.fallback_rpc}")
-            self.w3 = self.fallback_w3
-
-        self.account = self.w3.eth.account.from_key(self.config.PRIVATE_KEY) if hasattr(self.config, 'PRIVATE_KEY') and self.config.PRIVATE_KEY else None
+        self.primary_rpc = getattr(self.config, "RPC_URL", DEFAULT_RPCS[0])
+        self.wss_rpc = getattr(self.config, "RPC_WSS_URL", "")
+        extra = getattr(self.config, "EXTRA_RPC_URLS", "") or ""
+        extra_list = [u.strip() for u in extra.split(",") if u.strip()]
+        fallback = getattr(self.config, "FALLBACK_RPC_URL", DEFAULT_RPCS[1])
+        pool: List[str] = []
+        for url in [self.primary_rpc, fallback] + extra_list + DEFAULT_RPCS:
+            if url and url not in pool:
+                pool.append(url)
+        self.rpc_pool = pool
+        self.chain_id = int(getattr(self.config, "CHAIN_ID", 4663))
+        self._rpc_index = 0
+        self.w3 = self._connect(self.rpc_pool[0])
+        self._ensure_connected()
+        self.fallback_rpc = self.rpc_pool[min(1, len(self.rpc_pool) - 1)]
+        self.fallback_w3 = self.w3
+        self.account = (
+            self.w3.eth.account.from_key(self.config.PRIVATE_KEY)
+            if hasattr(self.config, "PRIVATE_KEY") and self.config.PRIVATE_KEY
+            else None
+        )
         self._eth_price_usd: Optional[float] = None
         self._eth_price_timestamp: float = 0
         self._price_cache_ttl = 60
+
+    def _connect(self, url: str):
+        return Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
+
+    def _ensure_connected(self):
+        last_err = None
+        for i, url in enumerate(self.rpc_pool):
+            try:
+                w3 = self._connect(url)
+                if w3.is_connected():
+                    self.w3 = w3
+                    self._rpc_index = i
+                    logger.info(f"RPC connected: {url}")
+                    return
+            except Exception as e:
+                last_err = e
+                logger.warning(f"RPC failed ({url}): {e}")
+        logger.error(f"No RPC reachable. Last error: {last_err}")
+
+    def rotate_rpc(self):
+        if len(self.rpc_pool) <= 1:
+            return
+        self._rpc_index = (self._rpc_index + 1) % len(self.rpc_pool)
+        url = self.rpc_pool[self._rpc_index]
+        logger.warning(f"Rotating RPC -> {url}")
+        self.w3 = self._connect(url)
+        self.fallback_rpc = url
+        self.fallback_w3 = self.w3
 
     async def _run_in_thread(self, func, *args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
 
     async def _retry(self, func, *args, **kwargs):
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 return await self._run_in_thread(func, *args, **kwargs)
             except Exception as e:
                 err_str = str(e)
-                # Contract reverts on view probes are normal (e.g. pool not graduated yet)
                 if "execution reverted" in err_str:
                     logger.debug(f"Contract view call returned revert: {e}")
                     raise
-                logger.warning(f"Network error in chain call (attempt {attempt + 1}/3): {e}")
-                if attempt == 1 and hasattr(self, 'fallback_w3'):
-                    logger.warning(f"Switching active provider to fallback RPC: {self.fallback_rpc}")
-                    self.w3 = self.fallback_w3
-                if attempt == 2:
+                logger.warning(f"Network error in chain call (attempt {attempt + 1}/4): {e}")
+                if attempt >= 1:
+                    self.rotate_rpc()
+                if attempt == 3:
                     raise
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.4 * (attempt + 1))
 
     async def get_eth_balance(self) -> float:
-        if getattr(self.config, 'DRY_RUN', True) and not self.account:
+        if getattr(self.config, "DRY_RUN", True) and not self.account:
             logger.info("[DRY RUN] No private key provided, using simulated balance of 0.0200 ETH ($50.00)")
             return 0.02
         if not self.account:
             return 0.0
         try:
             balance_wei = await self._retry(self.w3.eth.get_balance, self.account.address)
-            return float(self.w3.from_wei(balance_wei, 'ether'))
+            return float(self.w3.from_wei(balance_wei, "ether"))
         except Exception as e:
-            if getattr(self.config, 'DRY_RUN', True):
-                logger.warning(f"[DRY RUN] Could not fetch live on-chain balance ({e}), using simulated 0.0200 ETH ($50.00)")
-                return 0.02
-            raise
+            logger.warning(f"Could not fetch live on-chain balance ({e}), using 0.0 so startup can continue")
+            return 0.0
 
     async def get_token_balance(self, token_address: str) -> float:
         if not self.account:
@@ -91,57 +120,34 @@ class ChainClient:
         balance_raw = await self._retry(contract.functions.balanceOf(self.account.address).call)
         decimals = await self.get_token_decimals(token_address)
         return balance_raw / (10 ** decimals)
-        
+
     async def get_eth_price_usd(self) -> float:
         now = time.time()
         if self._eth_price_usd and (now - self._eth_price_timestamp) < self._price_cache_ttl:
             return self._eth_price_usd
-            
+
         timeout = aiohttp.ClientTimeout(total=3)
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        
-        # Source 1: Coinbase
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get("https://api.coinbase.com/v2/prices/ETH-USD/spot") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        price = float(data["data"]["amount"])
-                        self._eth_price_usd = price
-                        self._eth_price_timestamp = now
-                        return price
-        except Exception:
-            pass
+        headers = {"User-Agent": "Mozilla/5.0"}
 
-        # Source 2: Binance
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        price = float(data["price"])
-                        self._eth_price_usd = price
-                        self._eth_price_timestamp = now
-                        return price
-        except Exception:
-            pass
+        for url, parser in (
+            ("https://api.coinbase.com/v2/prices/ETH-USD/spot", lambda d: float(d["data"]["amount"])),
+            ("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", lambda d: float(d["price"])),
+            ("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd", lambda d: float(d["ethereum"]["usd"])),
+        ):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            price = parser(await resp.json())
+                            self._eth_price_usd = price
+                            self._eth_price_timestamp = now
+                            return price
+            except Exception:
+                pass
 
-        # Source 3: CoinGecko
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        price = float(data["ethereum"]["usd"])
-                        self._eth_price_usd = price
-                        self._eth_price_timestamp = now
-                        return price
-        except Exception:
-            pass
-            
         if self._eth_price_usd:
             return self._eth_price_usd
-        return 2500.0  # Fallback default
+        return 2500.0
 
     async def usd_to_eth(self, usd_amount: float) -> float:
         price = await self.get_eth_price_usd()
@@ -154,51 +160,48 @@ class ChainClient:
     async def get_nonce(self) -> int:
         if not self.account:
             raise ValueError("No private key configured")
-        return await self._retry(self.w3.eth.get_transaction_count, self.account.address, 'pending')
+        return await self._retry(self.w3.eth.get_transaction_count, self.account.address, "pending")
 
     async def estimate_gas(self, tx: Dict[str, Any]) -> int:
         base_estimate = await self._retry(self.w3.eth.estimate_gas, tx)
-        return int(base_estimate * getattr(self.config, 'GAS_MULTIPLIER', 1.2))
+        return int(base_estimate * getattr(self.config, "GAS_MULTIPLIER", 1.2))
 
     async def send_transaction(self, tx: Dict[str, Any]) -> str:
-        if getattr(self.config, 'DRY_RUN', True):
+        if getattr(self.config, "DRY_RUN", True):
             logger.info(f"[DRY RUN] Would send transaction: {tx}")
             return f"DRY_RUN_0x{int(time.time())}"
-            
+
         if not self.account:
             raise ValueError("No private key configured")
-            
-        if 'nonce' not in tx:
-            tx['nonce'] = await self.get_nonce()
-            
-        if 'gas' not in tx:
-            tx['gas'] = await self.estimate_gas(tx)
-            
-        if 'chainId' not in tx:
-            tx['chainId'] = 4663
 
-        # EIP-1559 Dynamic Gas Management with Safety Multiplier
-        gas_mult = float(getattr(self.config, 'GAS_MULTIPLIER', 1.3))
-        if 'maxFeePerGas' not in tx and 'gasPrice' not in tx:
+        if "nonce" not in tx:
+            tx["nonce"] = await self.get_nonce()
+        if "gas" not in tx:
+            tx["gas"] = await self.estimate_gas(tx)
+        if "chainId" not in tx:
+            tx["chainId"] = 4663
+
+        gas_mult = float(getattr(self.config, "GAS_MULTIPLIER", 1.3))
+        if "maxFeePerGas" not in tx and "gasPrice" not in tx:
             try:
-                latest_block = await self._retry(self.w3.eth.get_block, 'latest')
-                base_fee = latest_block.get('baseFeePerGas', None)
+                latest_block = await self._retry(self.w3.eth.get_block, "latest")
+                base_fee = latest_block.get("baseFeePerGas", None)
                 if base_fee:
-                    max_priority = int(base_fee * 0.1) or self.w3.to_wei(0.01, 'gwei')
+                    max_priority = int(base_fee * 0.1) or self.w3.to_wei(0.01, "gwei")
                     max_fee = int(base_fee * max(1.3, gas_mult)) + max_priority
-                    tx['maxFeePerGas'] = max_fee
-                    tx['maxPriorityFeePerGas'] = max_priority
+                    tx["maxFeePerGas"] = max_fee
+                    tx["maxPriorityFeePerGas"] = max_priority
                 else:
                     raw_gp = await self._retry(lambda: self.w3.eth.gas_price)
-                    tx['gasPrice'] = int(raw_gp * max(1.3, gas_mult))
+                    tx["gasPrice"] = int(raw_gp * max(1.3, gas_mult))
             except Exception:
                 raw_gp = await self._retry(lambda: self.w3.eth.gas_price)
-                tx['gasPrice'] = int(raw_gp * max(1.3, gas_mult))
-        elif 'gasPrice' in tx:
-            tx['gasPrice'] = int(tx['gasPrice'] * max(1.3, gas_mult))
-            
+                tx["gasPrice"] = int(raw_gp * max(1.3, gas_mult))
+        elif "gasPrice" in tx:
+            tx["gasPrice"] = int(tx["gasPrice"] * max(1.3, gas_mult))
+
         signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.account.key)
-        raw_tx_bytes = getattr(signed_tx, 'raw_transaction', getattr(signed_tx, 'rawTransaction', None))
+        raw_tx_bytes = getattr(signed_tx, "raw_transaction", getattr(signed_tx, "rawTransaction", None))
         tx_hash = await self._retry(self.w3.eth.send_raw_transaction, raw_tx_bytes)
         hash_hex = self.w3.to_hex(tx_hash)
         logger.info(f"Transaction sent: {hash_hex}")
@@ -207,7 +210,6 @@ class ChainClient:
     async def wait_for_receipt(self, tx_hash: str, timeout: int = 60) -> Dict[str, Any]:
         if tx_hash.startswith("DRY_RUN_"):
             return {"status": 1, "transactionHash": tx_hash}
-            
         start = time.time()
         while time.time() - start < timeout:
             try:
@@ -219,7 +221,6 @@ class ChainClient:
             except Exception as e:
                 logger.warning(f"Error waiting for receipt: {e}")
             await asyncio.sleep(2)
-            
         raise TimeoutError(f"Transaction {tx_hash} receipt not found after {timeout} seconds")
 
     async def get_token_decimals(self, token_address: str) -> int:
@@ -230,33 +231,20 @@ class ChainClient:
     async def approve_token(self, token_address: str, spender: str, amount: int) -> str:
         token_address = self.w3.to_checksum_address(token_address)
         spender = self.w3.to_checksum_address(spender)
-        
         contract = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
         allowance = await self._retry(contract.functions.allowance(self.account.address, spender).call)
-        
         if allowance >= amount:
             logger.info(f"Token {token_address} already approved for {spender}")
             return "ALREADY_APPROVED"
-            
-        if getattr(self.config, 'DRY_RUN', True):
+        if getattr(self.config, "DRY_RUN", True):
             logger.info(f"[DRY RUN] Would approve {amount} of {token_address} for {spender}")
             return f"DRY_RUN_APPROVE_0x{int(time.time())}"
-            
         tx = contract.functions.approve(spender, amount).build_transaction({
-            'from': self.account.address,
-            'gasPrice': await self._retry(lambda: self.w3.eth.gas_price)
+            "from": self.account.address,
+            "gasPrice": await self._retry(lambda: self.w3.eth.gas_price)
         })
-        
         logger.info(f"Approving token {token_address} for spender {spender}")
         tx_hash = await self.send_transaction(tx)
         if not tx_hash.startswith("DRY_RUN_"):
             await self.wait_for_receipt(tx_hash)
         return tx_hash
-
-
-if __name__ == '__main__':
-    from web3 import Web3
-    w3 = Web3(Web3.HTTPProvider("https://silent-clean-tent.robinhood-mainnet.quiknode.pro/fb9742dcdbac8e3afbacc17fc8859e433a719aa1/"))
-    print("Connected:", w3.is_connected())
-    print("Chain ID:", w3.eth.chain_id)   # must print 4663
-

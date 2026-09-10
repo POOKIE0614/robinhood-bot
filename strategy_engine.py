@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from typing import List
-from models import StrategyState, TradeDecision, CallSignal, Position, PositionStatus
+from models import StrategyState, TradeDecision, CallSignal, Position
 
 logger = logging.getLogger("copytrader")
 
@@ -50,7 +50,10 @@ class StrategyEngine:
                     self.total_pnl_usd = float(data.get("total_pnl_usd", self.total_pnl_usd))
                     state_name = data.get("state", "BASELINE")
                     self.state = StrategyState[state_name] if state_name in StrategyState.__members__ else StrategyState.BASELINE
-                    logger.info(f"💾 Restored persistent state: Balance=${self.balance_usd:.2f} | State={self.state.name} | Trades={self.total_trades} (W:{self.wins} L:{self.losses})")
+                    logger.info(
+                        f"💾 Restored persistent state: Balance=${self.balance_usd:.2f} | "
+                        f"State={self.state.name} | Trades={self.total_trades} (W:{self.wins} L:{self.losses})"
+                    )
         except Exception as e:
             logger.warning(f"Could not load state from {self._state_file}: {e}")
 
@@ -73,73 +76,56 @@ class StrategyEngine:
     def get_trade_decision(self, signal: CallSignal, eth_price_usd: float) -> TradeDecision:
         if self.state == StrategyState.HALTED:
             return TradeDecision(False, 0.0, 0.0, self.state, "Halted circuit breaker")
-        
         self._check_circuit_breaker()
         if self.state == StrategyState.HALTED:
             return TradeDecision(False, 0.0, 0.0, self.state, "Halted circuit breaker")
-
         if len(self.open_positions) >= self.config.MAX_CONCURRENT_POSITIONS:
             return TradeDecision(False, 0.0, 0.0, self.state, "Max concurrent positions")
-
         if not signal.contract_address:
             return TradeDecision(False, 0.0, 0.0, self.state, "No contract address")
-
         if any(p.contract_address.lower() == signal.contract_address.lower() for p in self.open_positions):
             return TradeDecision(False, 0.0, 0.0, self.state, "Position already open for token")
 
-        if signal.buy_tax > self.config.MAX_BUY_TAX or signal.sell_tax > self.config.MAX_SELL_TAX:
-            return TradeDecision(False, 0.0, 0.0, self.state, "High tax")
-
-        if signal.liquidity_usd is not None and signal.liquidity_usd < self.config.MIN_LIQUIDITY_USD:
-            return TradeDecision(False, 0.0, 0.0, self.state, "Low liquidity")
-
-        if signal.holders is not None and signal.holders < self.config.MIN_HOLDERS:
-            return TradeDecision(False, 0.0, 0.0, self.state, "Low holders")
+        buy_every = bool(getattr(self.config, "BUY_EVERY_SIGNAL", True))
+        if not buy_every:
+            if signal.buy_tax > self.config.MAX_BUY_TAX or signal.sell_tax > self.config.MAX_SELL_TAX:
+                return TradeDecision(False, 0.0, 0.0, self.state, "High tax")
+            if signal.liquidity_usd is not None and signal.liquidity_usd < self.config.MIN_LIQUIDITY_USD:
+                return TradeDecision(False, 0.0, 0.0, self.state, "Low liquidity")
+            if signal.holders is not None and signal.holders < self.config.MIN_HOLDERS:
+                return TradeDecision(False, 0.0, 0.0, self.state, "Low holders")
 
         if signal.dex and "long" in str(signal.dex).lower():
             return TradeDecision(False, 0.0, 0.0, self.state, "Skipping Longxyz (Proprietary signature-gated launchpad)")
 
         stake_usd = self.config.BASELINE_STAKE_USD if self.state == StrategyState.BASELINE else self.config.COMPOUND_STAKE_USD
-
-        if hasattr(self.config, 'BUFFER_GATE_USD') and self.config.BUFFER_GATE_USD > 0 and self.balance_usd < self.config.BUFFER_GATE_USD:
+        if hasattr(self.config, "BUFFER_GATE_USD") and self.config.BUFFER_GATE_USD > 0 and self.balance_usd < self.config.BUFFER_GATE_USD:
             stake_usd = self.config.BASELINE_STAKE_USD
             self.state = StrategyState.BASELINE
-
         if self.balance_usd - stake_usd < self.config.SAFETY_FLOOR_USD:
             return TradeDecision(False, 0.0, 0.0, self.state, "Not enough balance above floor")
 
         stake_eth = stake_usd / eth_price_usd if eth_price_usd > 0 else 0.0
-        return TradeDecision(True, stake_usd, stake_eth, self.state, "Met criteria")
+        reason = "Buy every parsed signal" if buy_every else "Met criteria"
+        return TradeDecision(True, stake_usd, stake_eth, self.state, reason)
 
     def record_trade_result(self, position: Position, is_win: bool):
         pnl = position.pnl_usd or 0.0
         self.balance_usd += pnl
         self.total_pnl_usd += pnl
         self.total_trades += 1
-
         if is_win:
             self.wins += 1
             self.consecutive_losses = 0
-            if self.state == StrategyState.BASELINE:
-                self.state = StrategyState.COMPOUND
-            else:
-                self.state = StrategyState.BASELINE
+            self.state = StrategyState.COMPOUND if self.state == StrategyState.BASELINE else StrategyState.BASELINE
         else:
             self.losses += 1
             self.consecutive_losses += 1
             self.max_consecutive_losses = max(self.max_consecutive_losses, self.consecutive_losses)
             self.state = StrategyState.BASELINE
-
         self._check_circuit_breaker()
         self._save_state()
-        
-        entry = {
-            "position_id": position.id,
-            "pnl": pnl,
-            "is_win": is_win,
-            "balance": self.balance_usd,
-            "state": self.state.name
-        }
+        entry = {"position_id": position.id, "pnl": pnl, "is_win": is_win, "balance": self.balance_usd, "state": self.state.name}
         self.trade_history.append(entry)
         logger.info(f"Recorded trade: {entry}")
 
