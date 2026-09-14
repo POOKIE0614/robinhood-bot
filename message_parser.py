@@ -10,7 +10,7 @@ logger = logging.getLogger("copytrader")
 class MessageParser:
     """Parses early call messages from Telegram."""
 
-    def __init__(self):
+    def __init__(self, allow_ticker_fallback: bool = False):
         # Universal ticker pattern matching "$TICKER · robinhood" with any prefix (EARLY CALL, NARRATIVE, etc.)
         self.ticker_pattern = re.compile(
             r"\$([A-Za-z0-9_\u4e00-\u9fff\U00010000-\U0010ffff]+)\s*·\s*robinhood", 
@@ -30,6 +30,8 @@ class MessageParser:
         self.proof_pattern = re.compile(r"(\d+)\s*elite\s*\+\s*(\d+)\s*good")
         self.dex_pattern = re.compile(r"DEX:\s*(.+?)$", re.MULTILINE)
         
+        self.allow_ticker_fallback = allow_ticker_fallback
+
         # Address matching for raw text (42 chars, starting with 0x)
         self.address_pattern = re.compile(r"0x[a-fA-F0-9]{40}")
 
@@ -92,9 +94,12 @@ class MessageParser:
 
             # Check reply_markup rows if not found yet
             if not contract_address and reply_markup and hasattr(reply_markup, 'rows'):
-                for row in reply_markup.rows:
+                # `rows`/`buttons` can be present but None (observed to raise
+                # TypeError, which the outer handler swallowed as a parse failure --
+                # losing the entities and text fallbacks below).
+                for row in (reply_markup.rows or []):
                     if hasattr(row, 'buttons'):
-                        for btn in row.buttons:
+                        for btn in (row.buttons or []):
                             url = getattr(btn, 'url', None)
                             if url:
                                 url_match = self.address_pattern.search(url)
@@ -139,8 +144,51 @@ class MessageParser:
                         else:
                             contract_address = all_addrs[0]
             
-            # DexScreener Fallback API if address not in message
+            # DexScreener fallback: the channel often posts no CA at all, so resolve
+            # it from the ticker. Two things matter here and both used to be wrong:
+            #
+            #  1. This runs a BLOCKING http call. TelegramListener now calls parse()
+            #     via asyncio.to_thread so it cannot freeze the event loop (and with
+            #     it the 2s price monitors on every open position).
+            #  2. It used to fall back to "any robinhood pair" when the symbol did
+            #     not match, which can buy a completely different token. On a chain
+            #     where anyone can mint the same ticker, that is how you buy a clone.
+            #     Now: exact symbol match only, and of those, the most liquid one.
+            # All four CA sources above failed. Dump exactly what arrived, because
+            # the interesting case is invisible otherwise: Telethon's
+            # `message.buttons` is a property that silently returns None when the
+            # chat entity is not in the session cache (live events hit this; history
+            # reads do not), and `reply_markup` is the raw fallback. Fires only on
+            # failure, so it costs nothing on the happy path.
             if not contract_address:
+                try:
+                    rm_buttons = []
+                    for row in (getattr(reply_markup, "rows", None) or []):
+                        for b in (getattr(row, "buttons", None) or []):
+                            rm_buttons.append(
+                                f"{type(b).__name__}(url={getattr(b, 'url', None)!r},"
+                                f"data={getattr(b, 'data', None)!r})"
+                            )
+                    near = [text[max(0, m.start() - 20):m.start() + 60]
+                            for m in re.finditer("0x", text or "")][:4]
+                    logger.warning(
+                        f"Msg {message_id} NO-CA dump: "
+                        f"buttons={type(buttons).__name__ if buttons else None} "
+                        f"reply_markup={type(reply_markup).__name__ if reply_markup else None} "
+                        f"rm_buttons={rm_buttons or None} "
+                        f"entity_types={sorted({type(e).__name__ for e in (entities or [])})} "
+                        f"0x_context={near}"
+                    )
+                except Exception as dump_err:
+                    logger.warning(f"NO-CA dump failed: {dump_err}")
+
+            if not contract_address and not self.allow_ticker_fallback:
+                logger.warning(
+                    f"${ticker}: no contract address in the buttons or text. Ticker"
+                    f" lookup is disabled (ALLOW_TICKER_FALLBACK=false) because this"
+                    f" chain has multiple tokens per ticker. Skipping this call."
+                )
+            if not contract_address and self.allow_ticker_fallback:
                 try:
                     import urllib.request
                     import json
@@ -149,28 +197,43 @@ class MessageParser:
                         headers={'User-Agent': 'Mozilla/5.0'}
                     )
                     res = json.loads(urllib.request.urlopen(req, timeout=3).read().decode('utf-8'))
-                    pairs = res.get('pairs', [])
-                    # First priority: robinhood chain pair matching ticker
-                    for p in pairs:
-                        if p.get('chainId') == 'robinhood' and p.get('baseToken', {}).get('symbol', '').upper() == ticker:
-                            addr = p.get('baseToken', {}).get('address')
-                            if addr and addr.startswith('0x') and len(addr) == 42:
-                                contract_address = addr
-                                logger.info(f"Resolved contract address for ${ticker} via DexScreener (Robinhood Chain): {contract_address}")
-                                break
-                    
-                    # Second priority: any robinhood chain pair
-                    if not contract_address:
-                        for p in pairs:
-                            if p.get('chainId') == 'robinhood':
-                                addr = p.get('baseToken', {}).get('address')
-                                if addr and addr.startswith('0x') and len(addr) == 42:
-                                    contract_address = addr
-                                    logger.info(f"Resolved contract address for ${ticker} via DexScreener (Robinhood Chain): {contract_address}")
-                                    break
+
+                    candidates = []
+                    for p in res.get('pairs', []) or []:
+                        if (p.get('chainId') or '').lower() not in ('robinhood', 'robinhoodchain'):
+                            continue
+                        base = p.get('baseToken') or {}
+                        addr = base.get('address') or ''
+                        if (base.get('symbol') or '').upper() != ticker.upper():
+                            continue
+                        if not (addr.startswith('0x') and len(addr) == 42):
+                            continue
+                        liq = float(((p.get('liquidity') or {}).get('usd') or 0))
+                        candidates.append((liq, addr))
+
+                    if candidates:
+                        candidates.sort(reverse=True)
+                        liq, contract_address = candidates[0]
+                        logger.info(
+                            f"Resolved ${ticker} via DexScreener: {contract_address} "
+                            f"(${liq:,.0f} liquidity)"
+                        )
+                        if len(candidates) > 1:
+                            others = ", ".join(f"{a} (${l:,.0f})" for l, a in candidates[1:4])
+                            logger.critical(
+                                f"${ticker} matches {len(candidates)} DIFFERENT tokens on this "
+                                f"chain. Picked the most liquid, which may NOT be the one that "
+                                f"was called. Others: {others}"
+                            )
+                    else:
+                        logger.warning(
+                            f"DexScreener has no ${ticker} pair on this chain yet "
+                            f"(a token minutes old may not be indexed). Skipping the call "
+                            f"rather than guessing a different token."
+                        )
                 except Exception as e:
                     logger.debug(f"DexScreener API fallback lookup failed for ${ticker}: {e}")
-            
+
             # 3. Mcap
             mcap_usd = None
             mcap_match = self.mcap_pattern.search(text)

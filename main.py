@@ -12,6 +12,7 @@ except Exception:
 
 from config import Config
 from logger_setup import setup_logging
+from trade_ledger import log_event
 from models import CallSignal, Position, PositionStatus, StrategyState
 from message_parser import MessageParser
 from telegram_listener import TelegramListener
@@ -33,12 +34,13 @@ class CopyTraderBot:
             f"PK={'set' if self.config.PRIVATE_KEY else 'MISSING'}"
         )
         self.config.validate()
-        self.parser = MessageParser()
+        self.parser = MessageParser(allow_ticker_fallback=self.config.ALLOW_TICKER_FALLBACK)
         self.chain_client = ChainClient(self.config)
         self.dex_trader = DexTrader(self.chain_client, self.config)
         self.strategy_engine = StrategyEngine(self.config)
         self.position_monitor = PositionMonitor(
-            self.config, self.dex_trader, self.chain_client, self.on_position_closed
+            self.config, self.dex_trader, self.chain_client, self.on_position_closed,
+            on_position_changed=lambda _position: self.strategy_engine.save(),
         )
         self.telegram_listener = TelegramListener(self.config, self.parser, self.on_signal)
 
@@ -57,6 +59,19 @@ class CopyTraderBot:
 ╚══════════════════════════════════════════════════╝
         """
         print(banner)
+        # Print the mtime of the trading code at startup. We repeatedly lost time
+        # to a restart that happened moments BEFORE a fix landed, then read the
+        # same error and assumed the fix had failed. Now the log says which code
+        # is running and nobody has to guess.
+        try:
+            import os as _os
+            from datetime import datetime as _dt
+            _code = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "dex_trader.py")
+            _mt = _dt.fromtimestamp(_os.path.getmtime(_code))
+            self.logger.info(f"CODE VERSION: dex_trader.py last modified {_mt:%Y-%m-%d %H:%M:%S}")
+        except Exception as _e:
+            self.logger.warning(f"Could not read code version: {_e}")
+
         self.logger.info("Initializing copy-trader components...")
         await self.dex_trader.initialize()
 
@@ -72,8 +87,79 @@ class CopyTraderBot:
         except Exception as e:
             self.logger.warning(f"Startup balance fetch failed ({e}). Continuing — listener will still start.")
 
+        await self.recover_open_positions()
+
         self.logger.info("Connecting to Telegram channel listener...")
         await self.telegram_listener.start()
+
+    async def recover_open_positions(self):
+        """
+        Re-adopt positions that outlived the previous run.
+
+        The state file records what we thought we held; the chain records what we
+        actually hold, and the chain wins. A position whose tokens are gone was
+        already exited elsewhere; one that still has a balance needs its exit ladder
+        running again, or it sits there with no stop loss and no take-profit.
+        """
+        carried = list(self.strategy_engine.open_positions)
+        if not carried:
+            return
+
+        self.logger.info(f"Reconciling {len(carried)} carried-over position(s)...")
+        resumed = dropped = stranded = 0
+
+        for position in carried:
+            if self.config.DRY_RUN:
+                # Paper positions have no on-chain balance to reconcile against.
+                await self.position_monitor.start_monitoring(position)
+                resumed += 1
+                continue
+
+            try:
+                balance = await self.chain_client.get_token_balance(position.contract_address)
+            except Exception as e:
+                stranded += 1
+                self.logger.error(
+                    f"Cannot read balance for ${position.ticker} ({position.contract_address}): {e}. "
+                    f"Leaving it recorded but UNMONITORED - check this one by hand."
+                )
+                continue
+
+            # A swap can leave a few base units behind, so "closed" cannot mean
+            # exactly zero -- a live exit left 204298 units of a 2.88e21 balance.
+            # Anything under 0.1% of what we recorded is dust, not a position.
+            dust_floor = max((position.remaining_tokens or 0.0) * 0.001, 0.0)
+            if balance <= dust_floor:
+                self.logger.info(
+                    f"${position.ticker}: wallet holds only {balance:g} of "
+                    f"{position.contract_address} (dust); already exited. Dropping."
+                )
+                self.strategy_engine.remove_position(position.id)
+                dropped += 1
+                continue
+
+            recorded = position.remaining_tokens or 0.0
+            if abs(balance - recorded) > max(balance, recorded, 1e-18) * 0.01:
+                self.logger.warning(
+                    f"${position.ticker}: recorded {recorded:,.4f} tokens but wallet holds "
+                    f"{balance:,.4f}. Trusting the chain."
+                )
+            position.remaining_tokens = balance
+
+            await self.position_monitor.start_monitoring(position)
+            resumed += 1
+            self.logger.info(
+                f"Resumed ${position.ticker}: {balance:,.4f} tokens | entry {position.entry_price_eth:.12g} ETH | "
+                f"TP1={'hit' if position.tp1_hit else 'pending'} TP2={'hit' if position.tp2_hit else 'pending'} | "
+                f"stop {position.trailing_stop_multiplier:.2f}x"
+            )
+
+        self.strategy_engine.save()
+        self.logger.info(f"Recovery complete: {resumed} resumed, {dropped} dropped, {stranded} unreadable.")
+        if stranded:
+            self.logger.critical(
+                f"{stranded} position(s) could not be reconciled and are NOT being monitored."
+            )
 
     async def on_signal(self, signal: CallSignal):
         start_time = time.time()
@@ -113,6 +199,7 @@ class CopyTraderBot:
             self.strategy_engine.add_position(position)
             await self.position_monitor.start_monitoring(position)
             self.logger.info(f"Position opened: {position.id} for ${position.ticker} ({tokens_bought:,.2f} tokens)")
+            log_event("position_opened", **position.to_dict())
         except Exception as e:
             self.logger.error(f"Trade execution exception for ${signal.ticker}: {e}", exc_info=True)
 
@@ -123,6 +210,13 @@ class CopyTraderBot:
         self.logger.info(
             f"Position closed: ${position.ticker} | Win: {is_win} | PnL: ${pnl:+.2f} | "
             f"New Balance: ${self.strategy_engine.balance_usd:.2f} | Next State: {self.strategy_engine.state.value}"
+        )
+        log_event(
+            "position_closed",
+            is_win=is_win,
+            balance_usd=self.strategy_engine.balance_usd,
+            strategy_state=self.strategy_engine.state.value,
+            **position.to_dict(),
         )
         if self.strategy_engine.state == StrategyState.HALTED:
             self.logger.critical("CIRCUIT BREAKER TRIGGERED ($40 Floor Reached). All further trading is HALTED.")

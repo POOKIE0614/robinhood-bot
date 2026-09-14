@@ -5,12 +5,18 @@
 # Uses Universal Router for V4
 # Uses V2 Router for V2
 
+import logging
 import time
 import requests
 import eth_abi
 import concurrent.futures
 from eth_utils import keccak, to_checksum_address
 from web3 import Web3
+from chain_client import eip1559_fees
+
+# This module used logger.warning() at the stranded-stock guard without ever
+# defining it, so the one branch that guard exists for raised NameError instead.
+logger = logging.getLogger("copytrader")
 
 CHAIN_ID = 4663
 ZERO = "0x0000000000000000000000000000000000000000"
@@ -529,11 +535,8 @@ class StockV4Router:
         return {"venue": "NONE", "quote": ZERO, "target": ZERO}
 
     def _gas_fees(self):
-        latest = self.w3.eth.get_block("latest")
-        base = int(latest.get("baseFeePerGas") or self.w3.eth.gas_price or self.w3.to_wei(0.5, "gwei"))
-        prio = max(self.w3.to_wei(0.02, "gwei"), int(base * 0.05))
-        max_fee = int(base * 1.5) + prio
-        return max_fee, prio
+        """One shared fee policy -- see eip1559_fees in chain_client.py."""
+        return eip1559_fees(self.w3)
 
     def _send(self, tx):
         signed = self.account.sign_transaction(tx)
@@ -726,43 +729,60 @@ class StockV4Router:
         amount_wei = self.w3.to_wei(amount_eth, "ether")
         me = self.account.address
 
-        # --- tx1: ETH -> STOCK (1-hop, same as BETA) ---
-        # prefer V3 WETH/STOCK or V3 WETH/USDG/STOCK if it exists
-        stock_v3 = None
-        for f in V3_FEES:
-            if self._v3_pool(WETH, stock, f):
-                stock_v3 = f
-                break
-        if stock_v3 is not None:
-            tx1 = self.buy_v3_multihop([WETH, stock], [stock_v3], amount_wei, me, 1, 280000)
+        _bal_abi = [{"inputs": [{"name": "a", "type": "address"}], "name": "balanceOf",
+                     "outputs": [{"type": "uint256"}], "stateMutability": "view",
+                     "type": "function"}]
+        _stock = self.w3.eth.contract(stock, abi=_bal_abi)
+        stock_before = _stock.functions.balanceOf(me).call()
+
+        # Leg 2 can revert after leg 1 has already bought the stock, leaving it
+        # stranded in the wallet. Retrying used to re-run leg 1 and buy the stock
+        # AGAIN, doubling the ETH spent. If we are already holding some, use that
+        # instead of buying more.
+        if stock_before > 0:
+            logger.warning(
+                f"Already holding {stock_before} of {stock} from an earlier attempt - "
+                f"reusing it instead of buying more ETH worth"
+            )
+            acquired = stock_before
+            tx1 = None
         else:
-            usdg_v3 = self._v3_pool(WETH, USDG, 500)
-            stock_usdg = None
+            acquired = None
+
+        if acquired is None:
+            # --- tx1: ETH -> STOCK (1-hop, same as BETA) ---
+            # prefer V3 WETH/STOCK or V3 WETH/USDG/STOCK if it exists
+            stock_v3 = None
             for f in V3_FEES:
-                if self._v3_pool(USDG, stock, f):
-                    stock_usdg = f
+                if self._v3_pool(WETH, stock, f):
+                    stock_v3 = f
                     break
-            if usdg_v3 and stock_usdg is not None:
-                tx1 = self.buy_v3_multihop([WETH, USDG, stock], [500, stock_usdg], amount_wei, me, 1, 380000)
+            if stock_v3 is not None:
+                tx1 = self.buy_v3_multihop([WETH, stock], [stock_v3], amount_wei, me, 1, 280000)
             else:
-                tx1 = self.buy_v4([{
-                    "token_in": WETH, "token_out": stock,
-                    "amount_in": amount_wei, "min_out": 1,
-                    "fee": 500, "tick": 10, "hook": ZERO,
-                }], amount_wei, me, 500000)
+                usdg_v3 = self._v3_pool(WETH, USDG, 500)
+                stock_usdg = None
+                for f in V3_FEES:
+                    if self._v3_pool(USDG, stock, f):
+                        stock_usdg = f
+                        break
+                if usdg_v3 and stock_usdg is not None:
+                    tx1 = self.buy_v3_multihop([WETH, USDG, stock], [500, stock_usdg], amount_wei, me, 1, 380000)
+                else:
+                    tx1 = self.buy_v4([{
+                        "token_in": WETH, "token_out": stock,
+                        "amount_in": amount_wei, "min_out": 1,
+                        "fee": 500, "tick": 10, "hook": ZERO,
+                    }], amount_wei, me, 500000)
 
-        self.w3.eth.wait_for_transaction_receipt(tx1, timeout=60)
-
-        erc20 = self.w3.eth.contract(stock, abi=[{
-            "inputs": [{"name": "a", "type": "address"}],
-            "name": "balanceOf",
-            "outputs": [{"type": "uint256"}],
-            "stateMutability": "view",
-            "type": "function",
-        }])
-        stock_bal = erc20.functions.balanceOf(me).call()
-        if stock_bal <= 0:
-            raise RuntimeError(f"tx1 filled no stock: {tx1}")
+        if acquired is None:
+            self.w3.eth.wait_for_transaction_receipt(tx1, timeout=60)
+            # Only what THIS leg bought -- reading the whole balance would sweep
+            # stock stranded by an earlier failed attempt into this trade too.
+            acquired = _stock.functions.balanceOf(me).call() - stock_before
+            if acquired <= 0:
+                raise RuntimeError(f"tx1 filled no stock: {tx1}")
+        stock_bal = acquired
 
         # approve Universal Router if needed
         allow_abi = [{
@@ -795,19 +815,42 @@ class StockV4Router:
         )
         return tx1, tx2
 
-    def buy_usdg_two_tx(self, token: str, amount_eth: float, token_fee=3000, token_tick=60, token_hook=None):
+    def buy_usdg_two_tx(self, token: str, amount_eth: float, token_fee=3000, token_tick=60, token_hook=None,
+                        min_out_fn=None):
+        """
+        min_out_fn(usdg_amount) -> int lets the caller quote leg 2 once leg 1's
+        output is known, since that amount is not knowable up front. DexTrader
+        passes one; without it leg 2 goes out unprotected, so callers that handle
+        real money should always supply it.
+        """
         token = _cs(token)
         hook = token_hook or ZERO
         amount_wei = self.w3.to_wei(amount_eth, "ether")
         me = self.account.address
+        usdg = self.w3.eth.contract(USDG, abi=ERC20_ABI)
+
+        # Spend only the USDG this trade actually bought. Reading the whole
+        # balance here would sweep any USDG the wallet already held -- including
+        # another position's proceeds -- into this one token.
+        usdg_before = usdg.functions.balanceOf(me).call()
         tx1 = self.buy_v3_multihop([WETH, USDG], [500], amount_wei, me, 1, 280000)
         self.w3.eth.wait_for_transaction_receipt(tx1, timeout=60)
-        usdg_bal = self.w3.eth.contract(USDG, abi=ERC20_ABI).functions.balanceOf(me).call()
-        if usdg_bal <= 0:
+        acquired = usdg.functions.balanceOf(me).call() - usdg_before
+        if acquired <= 0:
             raise RuntimeError(f"tx1 filled no USDG: {tx1}")
+
         fee = int(token_fee) if token_fee is not None and int(token_fee) >= 0 else 2500
         tick = int(token_tick) if token_tick and int(token_tick) > 0 else 25
-        tx2 = self.buy_v4_erc20_in(USDG, token, usdg_bal, 1, fee, tick, hook)
+
+        leg2_min = 1
+        if min_out_fn is not None:
+            leg2_min = max(1, int(min_out_fn(acquired) or 0))
+            if leg2_min <= 1:
+                raise RuntimeError(
+                    f"Could not quote USDG->{token} leg; refusing to swap {acquired} "
+                    f"USDG without slippage protection"
+                )
+        tx2 = self.buy_v4_erc20_in(USDG, token, acquired, leg2_min, fee, tick, hook)
         return tx1, tx2
 
     def probe_v4_key(self, token: str, quote: str):
@@ -844,19 +887,27 @@ class StockV4Router:
         })
         return self._send(tx)
 
-    def sell_to_eth(self, token: str, amount_tokens: int, fee=0, tick=200, hook=None, quote=None):
+    def sell_to_eth(self, token: str, amount_tokens: int, fee=0, tick=200, hook=None, quote=None,
+                    min_out: int = 1):
+        """
+        min_out is the caller's ETH floor for the whole sale. It defaults to 1 only
+        so older callers keep working — DexTrader.sell_token passes a quoted value.
+        """
         token = _cs(token)
         hook = hook or PONS_HOOK
         quote = quote or WETH
         qlow = str(quote).lower()
         me = self.account.address
+        min_out = max(1, int(min_out))
         if qlow in (NATIVE.lower(), WETH.lower(), ZERO.lower()):
             self.ensure_permit2(token, amount_tokens)
             pull = eth_abi.encode(["address", "address", "uint160"], [token, UNIVERSAL_ROUTER, int(amount_tokens)])
-            v4 = make_v4_swap_input(token, WETH, amount_tokens, 1, int(fee), int(tick) if tick > 0 else 60, hook)
-            unwrap = eth_abi.encode(["address", "uint256"], [me, 1])
-            commands = bytes([0x02, 0x10, UNWRAP_WETH])
-            inputs = [pull, v4, unwrap]
+            v4 = make_v4_swap_input(token, WETH, amount_tokens, min_out, int(fee), int(tick) if tick > 0 else 60, hook)
+            unwrap = eth_abi.encode(["address", "uint256"], [me, min_out])
+            # SETTLE_ALL inside the V4 swap pulls via Permit2 already; adding a
+            # PERMIT2_TRANSFER_FROM made it pull twice and revert.
+            commands = bytes([0x10, UNWRAP_WETH])
+            inputs = [v4, unwrap]
             max_fee, prio = self._gas_fees()
             tx = self.ur.functions.execute(commands, inputs, int(time.time()) + 300).build_transaction({
                 "from": me, "value": 0, "gas": 500000,
@@ -869,24 +920,32 @@ class StockV4Router:
                 raise RuntimeError(f"V4 ETH sell estimate revert: {e}")
             return self._send(tx)
 
+        # Spend only what this leg produced. Reading the whole balance would sweep
+        # any quote token the wallet already held into this sale.
+        q_before = self._erc20_bal(quote)
         tx1 = self.buy_v4_erc20_in(token, quote, amount_tokens, 1, int(fee), int(tick) if tick > 0 else 200, hook)
         self.w3.eth.wait_for_transaction_receipt(tx1, timeout=60)
-        q_bal = self._erc20_bal(quote)
+        q_bal = self._erc20_bal(quote) - q_before
         if q_bal <= 0:
             raise RuntimeError(f"V4 sell hop filled no quote ({quote}): {tx1}")
+
+        # min_out is an ETH floor, so it belongs on the final leg. Leg 1 stays
+        # unprotected: a bad fill there makes leg 2 revert on this floor rather
+        # than draining the position, but it can strand the quote token — the
+        # caller retries, and the stranded balance is excluded by the delta above.
         if _cs(quote).lower() == USDG.lower():
-            return self.sell_v3_path([USDG, WETH], [500], q_bal)
+            return self.sell_v3_path([USDG, WETH], [500], q_bal, min_out=min_out)
         stock = _cs(quote)
         for f in V3_FEES:
             if self._v3_pool(stock, WETH, f):
-                return self.sell_v3_path([stock, WETH], [f], q_bal)
+                return self.sell_v3_path([stock, WETH], [f], q_bal, min_out=min_out)
         stock_usdg = None
         for f in V3_FEES:
             if self._v3_pool(stock, USDG, f):
                 stock_usdg = f
                 break
         if stock_usdg is not None:
-            return self.sell_v3_path([stock, USDG, WETH], [stock_usdg, 500], q_bal)
+            return self.sell_v3_path([stock, USDG, WETH], [stock_usdg, 500], q_bal, min_out=min_out)
         raise RuntimeError(f"No V3 path stock->ETH for {stock}")
 
     def ensure_permit2(self, token, amount):

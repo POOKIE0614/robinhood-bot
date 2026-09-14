@@ -2,10 +2,6 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 
-class TradeFilter(logging.Filter):
-    def filter(self, record):
-        return getattr(record, 'is_trade', False)
-
 def setup_logging():
     logger = logging.getLogger("copytrader")
     logger.setLevel(logging.DEBUG)
@@ -53,15 +49,12 @@ def setup_logging():
     file_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     file_handler.setFormatter(file_formatter)
 
-    # Trade File Handler
-    trade_handler = logging.FileHandler("logs/trades.log", encoding="utf-8")
-    trade_handler.setLevel(logging.INFO)
-    trade_handler.setFormatter(file_formatter)
-    trade_handler.addFilter(TradeFilter())
+    # Structured trade events go to logs/events.jsonl via trade_ledger.py, on its
+    # own non-propagating logger. A handler-level Filter cannot do that job: it
+    # would select records for this file without hiding them from the console.
 
     if not logger.handlers:
         logger.addHandler(console_handler)
         logger.addHandler(file_handler)
-        logger.addHandler(trade_handler)
 
     return logger

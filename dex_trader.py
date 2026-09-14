@@ -3,6 +3,7 @@ import sys
 import json
 import logging
 import asyncio
+from chain_client import eip1559_fees
 import time
 import aiohttp
 from typing import Tuple, Dict, Any, Optional
@@ -24,7 +25,36 @@ from stock_v4_routes import (
     fetch_dexscreener,
     map_ds_pair,
     pool_id_from_key,
+    encode_v3_path,
 )
+
+V3_QUOTER_ABI = [
+    {"inputs": [{"components": [
+        {"name": "tokenIn", "type": "address"}, {"name": "tokenOut", "type": "address"},
+        {"name": "amountIn", "type": "uint256"}, {"name": "fee", "type": "uint24"},
+        {"name": "sqrtPriceLimitX96", "type": "uint160"}], "name": "params", "type": "tuple"}],
+     "name": "quoteExactInputSingle",
+     "outputs": [{"name": "amountOut", "type": "uint256"}, {"name": "sqrtPriceX96After", "type": "uint160"},
+                 {"name": "initializedTicksCrossed", "type": "uint32"}, {"name": "gasEstimate", "type": "uint256"}],
+     "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"name": "path", "type": "bytes"}, {"name": "amountIn", "type": "uint256"}],
+     "name": "quoteExactInput",
+     "outputs": [{"name": "amountOut", "type": "uint256"}, {"name": "sqrtPriceX96AfterList", "type": "uint160[]"},
+                 {"name": "initializedTicksCrossedList", "type": "uint32[]"}, {"name": "gasEstimate", "type": "uint256"}],
+     "stateMutability": "nonpayable", "type": "function"},
+]
+
+V4_QUOTER_ABI = [
+    {"inputs": [{"components": [
+        {"components": [{"name": "currency0", "type": "address"}, {"name": "currency1", "type": "address"},
+                        {"name": "fee", "type": "uint24"}, {"name": "tickSpacing", "type": "int24"},
+                        {"name": "hooks", "type": "address"}], "name": "poolKey", "type": "tuple"},
+        {"name": "zeroForOne", "type": "bool"}, {"name": "exactAmount", "type": "uint128"},
+        {"name": "hookData", "type": "bytes"}], "name": "params", "type": "tuple"}],
+     "name": "quoteExactInputSingle",
+     "outputs": [{"name": "amountOut", "type": "uint256"}, {"name": "gasEstimate", "type": "uint256"}],
+     "stateMutability": "nonpayable", "type": "function"},
+]
 
 # =============== STOCK TOKENS (Robinhood Chain) ===============
 STOCK_TOKENS = EXTENDED_STOCK_TOKENS
@@ -263,6 +293,10 @@ class DexTrader:
         self.router02   = self.w3.eth.contract(address=self.swap_router02_addr, abi=SWAP_ROUTER02_ABI)
         self.v2_router  = self.w3.eth.contract(address=self.w3.to_checksum_address(UNISWAP_V2_ROUTER), abi=V2_ROUTER_ABI)
         self.state_view = self.w3.eth.contract(address=self.w3.to_checksum_address(UNISWAP_V4_STATE_VIEW), abi=STATE_VIEW_ABI)
+        # Both quoters were declared as constants but never instantiated, which is
+        # why every swap shipped with min_out = 1. See the slippage section below.
+        self.v3_quoter = self.w3.eth.contract(address=self.w3.to_checksum_address(UNISWAP_V3_QUOTER_V2), abi=V3_QUOTER_ABI)
+        self.v4_quoter = self.w3.eth.contract(address=self.w3.to_checksum_address(UNISWAP_V4_QUOTER), abi=V4_QUOTER_ABI)
         self.stock_v4   = StockV4Router(self.w3, self.chain.account if hasattr(self.chain, 'account') else None)
 
         # Venues with pre-flight simulation disabled (Default: only LAUNCHPAD_CURVE_ETH)
@@ -278,6 +312,15 @@ class DexTrader:
         # Populated when DexScreener resolves a V4 pair so buy_token / sell_token
         # can use the real tick spacing + hook instead of hardcoded defaults.
         self._v4_pool_params_cache: Dict[str, dict] = {}
+
+        # Which currency the live V4 pool is keyed on: {(token, fee, tick, hook):
+        # (currency_in, needs_wrap)}. See _resolve_v4_currency_in.
+        self._v4_currency_cache: Dict[Tuple[str, int, int, str], Tuple[str, bool]] = {}
+
+        # Resolved V3 pool addresses: {(token, quote): pool}. See _resolve_v3_pool.
+        # Only successful lookups are cached, so a pool that does not exist yet
+        # keeps being retried.
+        self._v3_pool_cache: Dict[Tuple[str, str], str] = {}
 
         # O(1) Token Curve Cache
         self._curve_cache_file = os.path.join(os.path.dirname(__file__), "cache", "curve_cache.json")
@@ -309,6 +352,12 @@ class DexTrader:
             logger.debug(f"Curve cache save warning: {e}")
 
     async def initialize(self):
+        # Do the chain-id round trip at startup. It used to happen inside the first
+        # detect_venue_and_route(), putting ~700ms onto the very first snipe.
+        try:
+            await self.verify_chain_id()
+        except Exception as e:
+            logger.error(f"Chain ID verification failed at startup: {e}")
         logger.info(f"Initialized DexTrader on Chain ID 4663 with Universal Router: {self.uni_router_address}")
 
     async def verify_chain_id(self):
@@ -482,37 +531,179 @@ class DexTrader:
             return cached
 
         result = await self._detect_venue_and_route_uncached(token_cs)
+
+        # A token cannot be quoted against itself. USDG resolved to
+        # UNISWAP_V3_USDG with quote == USDG and priced at 0.5582 ETH -- $1403 for
+        # a $1 stablecoin, 1403x wrong. Harmless for USDG (nobody calls it), but
+        # the same route on a real token would hand position_monitor a garbage
+        # entry price and the ladder would fire on noise.
+        if result[0] != "NONE" and result[2] and result[2].lower() == token_cs.lower():
+            logger.warning(
+                f"Discarding self-quoted route for {token_cs}: venue={result[0]} "
+                f"quote == token. Treating as NONE."
+            )
+            result = ("NONE", ZERO, self.weth_address, 0)
+
         if result[0] != "NONE":
             self._route_cache[token_cs] = result
         return result
 
-    def _v4_params_for(self, token_address: str, quote_asset: str, fee: int):
+    def _v4_candidate_quotes(self, quote_asset: str):
+        """
+        V4 keys native ETH as address(0), but detection reports WETH for some of
+        the same pools. For an ETH-ish quote try both representations.
+        """
+        q = (quote_asset or ZERO).lower()
+        if q in (ZERO.lower(), self.weth_address.lower()):
+            return [ZERO, self.weth_address]
+        # Prefer a NATIVE pool over the detected quote when one exists.
+        #
+        # A native pool is a single-hop swap, which is proven. Anything else needs
+        # the atomic 2-hop encode, which reverts on this chain (see
+        # build_v4_usdg_2hop_tx). SPY is the worked example: detection reported
+        # USDG, its USDG pool is genuinely live, and the 2-hop sell still reverted --
+        # while its native fee=10000 pool swapped fine at 151k gas and held MORE
+        # liquidity. A working route beats the nominally-correct one.
+        return [ZERO, self.w3.to_checksum_address(quote_asset)]
+
+    def _v4_key_is_live(self, token_cs: str, quote_asset: str, fee: int, tick: int, hook: str) -> bool:
+        return any(
+            self._v4_pool_has_liquidity(q, token_cs, fee, tick, hook)
+            for q in self._v4_candidate_quotes(quote_asset)
+        )
+
+    def v4_resolved_quote(self, token_address: str, fallback: str) -> str:
+        """
+        The quote the key resolver actually verified, which is not always the one
+        detection reported. Every consumer must use this or the PoolKey, the quote
+        and the built swap end up describing different pools.
+        """
+        cached = self._v4_pool_params_cache.get(self.w3.to_checksum_address(token_address), {})
+        return cached.get("quote") or fallback
+
+    def _remember_v4_key(self, token_cs: str, quote_asset: str, fee: int, tick: int, hook: str) -> None:
+        self._v4_pool_params_cache[token_cs] = {
+            "tick": int(tick), "hook": hook, "fee": int(fee),
+            "quote": quote_asset, "verified": True,
+        }
+
+    def _v4_params_for(self, token_address: str, quote_asset: str, fee: int) -> Tuple[int, int, str]:
+        """
+        Resolve the V4 PoolKey (fee, tick, hook) for a token — verify, then probe.
+
+        This used to probe only when the cached tick/fee were *missing*, so a key
+        guessed from DexScreener's defaults (tick=200, hook=PONS) was trusted
+        without ever asking whether that pool exists. That is why buys guessed one
+        key while sells probed and found a different, live one — and why V4 buys
+        and V4 price polls failed together on the same tokens.
+        """
         token_cs = self.w3.to_checksum_address(token_address)
         cached = self._v4_pool_params_cache.get(token_cs, {})
+        if cached.get("verified"):
+            return int(cached["fee"]), int(cached["tick"]), cached["hook"]
+
         tick = cached.get("tick", -1)
         hook = cached.get("hook") or ZERO
         fee_out = fee if fee is not None and int(fee) >= 0 else cached.get("fee", -1)
-        if cached.get("unresolved_key") or tick is None or int(tick) < 0 or int(fee_out) < 0:
+
+        # 0. For a non-ETH quote, look for a native pool FIRST even if the detected
+        #    quote's pool is live. Reaching a USDG- or stock-quoted pool needs the
+        #    multi-hop route, which is where every observed failure has happened
+        #    (AD-004, and the leg-2 revert that stranded SPY). A native pool is a
+        #    single hop and always works. It may be thinner -- the quoted min_out
+        #    rejects a bad fill, so the downside is a skipped trade, not a bad one.
+        q_low = (quote_asset or ZERO).lower()
+        if q_low not in (ZERO.lower(), self.weth_address.lower()):
+            # Deepest native pool, not the first one probe_v4_key stumbles on --
+            # see find_native_v4_pool for why that difference is worth 25x in gas.
+            best = None
+            for f_n, t_n, h_n in self.COMMON_V4_KEYS:
+                liq = self._v4_pool_liquidity(ZERO, token_cs, f_n, t_n, h_n)
+                if liq and (best is None or liq > best[0]):
+                    best = (liq, f_n, t_n, h_n)
+            if best is None:
+                try:
+                    probed_native = self.stock_v4.probe_v4_key(token_cs, ZERO)
+                except Exception:
+                    probed_native = None
+                if probed_native:
+                    best = (0, int(probed_native["fee"]), int(probed_native["tick"]),
+                            probed_native["hook"])
+            if best:
+                logger.info(
+                    f"Routing {token_cs} via its native pool (fee={best[1]} tick={best[2]}, "
+                    f"liquidity={best[0]}) instead of multi-hop through {quote_asset}"
+                )
+                self._remember_v4_key(token_cs, ZERO, best[1], best[2], best[3])
+                return int(best[1]), int(best[2]), best[3]
+
+        # 1. Believe the cached/detected key only if that pool actually exists.
+        if (not cached.get("unresolved_key") and tick is not None
+                and int(tick) >= 0 and int(fee_out) >= 0
+                and self._v4_key_is_live(token_cs, quote_asset, fee_out, tick, hook)):
+            self._remember_v4_key(token_cs, quote_asset, fee_out, tick, hook)
+            return int(fee_out), int(tick), hook
+
+        # 2. Guess was wrong or absent — brute-force the live key.
+        # ponytail: up to len(V4_FEE_TICKS_EXTENDED) x len(V4_HOOKS) view calls, but
+        # only on a cache miss whose cheap guess already failed. Far cheaper than the
+        # reverted snipe it prevents. If it ever shows up in entry latency, seed the
+        # search order from the detected fee instead of scanning the full table.
+        for candidate_quote in self._v4_candidate_quotes(quote_asset):
             try:
-                probed = self.stock_v4.probe_v4_key(token_cs, quote_asset)
+                probed = self.stock_v4.probe_v4_key(token_cs, candidate_quote)
             except Exception:
                 probed = None
             if probed:
-                tick, hook, fee_out = probed["tick"], probed["hook"], probed["fee"]
-                self._v4_pool_params_cache[token_cs] = {
-                    "tick": tick, "hook": hook, "fee": fee_out, "quote": quote_asset
-                }
-            else:
-                q = (quote_asset or ZERO).lower()
-                if q in (self.weth_address.lower(), ZERO.lower()):
-                    fee_out = 3000 if int(fee_out) < 0 else fee_out
-                    tick = 60 if int(tick) < 0 else tick
-                    hook = ZERO
-                else:
-                    fee_out = 0 if int(fee_out) < 0 else fee_out
-                    tick = 200 if int(tick) < 0 else tick
-                    hook = PONS_V2_HOOK
-        return int(fee_out), int(tick), hook
+                logger.info(
+                    f"V4 key probed for {token_cs}: fee={probed['fee']} tick={probed['tick']} "
+                    f"hook={probed['hook']} (guess was fee={fee_out} tick={tick} hook={hook})"
+                )
+                self._remember_v4_key(token_cs, candidate_quote, probed["fee"], probed["tick"], probed["hook"])
+                return int(probed["fee"]), int(probed["tick"]), probed["hook"]
+
+        # 3. Nothing live anywhere. Return the old static defaults so callers still
+        #    build a tx, and let simulation reject it rather than failing here.
+        logger.warning(f"No live V4 pool found for {token_cs} quote={quote_asset}; using defaults")
+        q = (quote_asset or ZERO).lower()
+        if q in (self.weth_address.lower(), ZERO.lower()):
+            return (3000 if int(fee_out) < 0 else int(fee_out)), (60 if int(tick) < 0 else int(tick)), ZERO
+        return (0 if int(fee_out) < 0 else int(fee_out)), (200 if int(tick) < 0 else int(tick)), PONS_V2_HOOK
+
+    # The fee/tick/hook combinations actually seen on this chain, most common first.
+    # probe_v4_key scans 54 combinations, which is too slow on a throttled RPC --
+    # detection was timing out and reporting NONE for tokens that were perfectly
+    # tradeable (SWARM had a native pool with 2.9e22 liquidity when it was skipped).
+    COMMON_V4_KEYS = [
+        (0, 200, PONS_V2_HOOK), (0, 200, ZERO), (0, 60, ZERO), (0, 1, ZERO),
+        (3000, 60, ZERO), (10000, 200, ZERO), (500, 10, ZERO), (2500, 25, ZERO),
+        (100, 1, ZERO), (802731, 9303, ZERO),
+    ]
+
+    async def find_native_v4_pool(self, token_cs: str):
+        """
+        Fast, targeted hunt for a native-ETH V4 pool. Returns (fee, tick, hook) or
+        None. Ten view calls instead of probe_v4_key's 54, ordered by what this
+        chain actually uses, so it survives a slow RPC.
+        """
+        # Check them all and take the DEEPEST, not the first hit. A token can have
+        # several native pools and they are not equivalent: GOOGL's fee=100/tick=1
+        # pool estimated at 3,690,531 gas while its fee=10000/tick=200 pool cost
+        # 150,260 for the same swap. Tiny tick spacing means the swap crosses far
+        # more initialised ticks, and each crossing costs gas. Same number of view
+        # calls either way, so there is no reason to take the first one.
+        best = None
+        for fee, tick, hook in self.COMMON_V4_KEYS:
+            try:
+                liq = await asyncio.to_thread(
+                    self._v4_pool_liquidity, ZERO, token_cs, fee, tick, hook)
+            except Exception:
+                continue
+            if liq and (best is None or liq > best[0]):
+                best = (liq, fee, tick, hook)
+        if best:
+            return best[1], best[2], best[3]
+        return None
 
     async def _detect_venue_and_route_uncached(self, token_address: str) -> Tuple[str, str, str, int]:
         """
@@ -527,12 +718,43 @@ class DexTrader:
         await self.verify_chain_id()
         token_cs = self.w3.to_checksum_address(token_address)
 
+        # Start the three independent probes together. They used to run one after
+        # another, so a DexScreener miss -- which is the normal case for a token
+        # minutes old, the exact kind being sniped -- added its latency in front of
+        # the curve lookup that actually resolves it.
+        contract_task = asyncio.create_task(self.is_contract(token_cs))
+        ds_task = asyncio.create_task(
+            asyncio.wait_for(asyncio.to_thread(fetch_dexscreener, token_cs), timeout=2.5)
+        )
+        curve_task = asyncio.create_task(self.resolve_token_curve(token_cs))
+
+        def _drop(*tasks):
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
         # ========== FAST FILTER: EOA vs Smart Contract ==========
-        if not await self.is_contract(token_cs):
-            logger.info(f"⏩ Skipping {token_cs} — not a contract (EOA)")
+        if not await contract_task:
+            _drop(ds_task, curve_task)
+            logger.info(f"⏩ Skipping {token_cs} -- not a contract (EOA)")
             print(f"⏩ Skipping {token_cs} — not a contract (EOA)")
             return "NONE", ZERO, self.weth_address, 0
         # ========================================================
+
+        # An ungraduated bonding curve is authoritative: the token has no DEX pool
+        # yet, so it can only be bought on the curve. Check that FIRST, because for
+        # a token minutes old -- the snipe case -- DexScreener has not indexed it
+        # and waiting on that miss just delays an answer already in hand.
+        try:
+            curve_addr, pair_token, is_graduated = await curve_task
+        except Exception as e:
+            logger.debug(f"Curve resolution failed for {token_cs}: {e}")
+            curve_addr, pair_token, is_graduated = None, ZERO, False
+        if curve_addr and not is_graduated:
+            _drop(ds_task)
+            if pair_token.lower() == self.usdg_address.lower():
+                return "LAUNCHPAD_CURVE_USDG", curve_addr, self.usdg_address, 0
+            return "LAUNCHPAD_CURVE_ETH", curve_addr, ZERO, 0
 
         # ========== 0. ULTRA-FAST DEXSCREENER CHECK (~150ms) ==========
         # IMPORTANT: fetch_dexscreener() uses blocking `requests`, not aiohttp.
@@ -541,10 +763,7 @@ class DexTrader:
         # HTTP call. Always push it to a thread, with a hard timeout so a slow
         # DexScreener response can't stall detection for long.
         try:
-            ds_pair = await asyncio.wait_for(
-                asyncio.to_thread(fetch_dexscreener, token_cs),
-                timeout=5.0
-            )
+            ds_pair = await ds_task
             if ds_pair:
                 mapped = map_ds_pair(token_cs, ds_pair, self.w3)
                 if mapped.get("venue") != "NONE":
@@ -556,6 +775,7 @@ class DexTrader:
                             "hook": mapped.get("hook", PONS_V2_HOOK),
                         }
                     logger.info(f"⚡ DexScreener fast-route: {mapped['venue']} | {mapped['quote']} | {mapped['target']}")
+                    _drop(curve_task)
                     return mapped["venue"], mapped["target"], mapped["quote"], mapped.get("fee", 0)
         except asyncio.TimeoutError:
             logger.debug(f"DexScreener fast-check timed out for {token_cs}, falling through to on-chain checks")
@@ -563,12 +783,7 @@ class DexTrader:
             logger.debug(f"DexScreener fast-check failed: {e}")
         # ==============================================================
 
-        # 1. Bonding Curve check (Direct O(1) method)
-        curve_addr, pair_token, is_graduated = await self.resolve_token_curve(token_cs)
-        if curve_addr and not is_graduated:
-            if pair_token.lower() == self.usdg_address.lower():
-                return "LAUNCHPAD_CURVE_USDG", curve_addr, self.usdg_address, 0
-            return "LAUNCHPAD_CURVE_ETH", curve_addr, ZERO, 0
+        # (bonding curve already resolved above)
 
         # 2. Parallel V3 WETH & V3 USDG Liquidity Probes
         async def check_v3_pool(quote_asset: str, fee: int, tag: str):
@@ -648,6 +863,20 @@ class DexTrader:
             if res is not None:
                 return res
 
+        # Before declaring NONE, check for a native V4 pool directly. Detection can
+        # miss one when the RPC is slow, and the stock_v4 fallback that used to
+        # cover this took 8s and timed out -- 16 of 18 live buy failures traced
+        # here, on tokens that had a live pool the whole time.
+        native = await self.find_native_v4_pool(token_cs)
+        if native:
+            fee_n, tick_n, hook_n = native
+            self._remember_v4_key(token_cs, ZERO, fee_n, tick_n, hook_n)
+            logger.info(
+                f"Late native V4 pool found for {token_cs}: fee={fee_n} tick={tick_n} "
+                f"-- would have been reported NONE"
+            )
+            return "UNISWAP_V4", self.uni_router_address, ZERO, fee_n
+
         return "NONE", ZERO, self.weth_address, 0
 
     async def detect_venue_fast(self, token: str) -> dict:
@@ -669,7 +898,6 @@ class DexTrader:
         token = self.w3.to_checksum_address(token)
         amount_wei = self.w3.to_wei(amount_eth, "ether")
         recipient = self.chain.account.address if self.chain.account else ZERO
-        min_out = 1
 
         print(f"⚡ FORCED BUY (No Sim) for {token}")
         logger.info(f"⚡ FORCED BUY (No Sim) for {token} with {amount_eth} ETH")
@@ -677,32 +905,27 @@ class DexTrader:
         if getattr(self.config, "DRY_RUN", True):
             fake_hash = f"DRY_RUN_0x{int(time.time())}"
             logger.info(f"[DRY RUN] Forced V4/Stock buy simulated: {fake_hash}")
-            return fake_hash, amount_eth * 1000.0
+            return fake_hash, await self._dry_run_fill(token, amount_eth)
 
-        WRAP_ETH = 0x0b
-        V4_SWAP  = 0x10
-        commands = bytes([WRAP_ETH, V4_SWAP])
-
-        wrap_input = eth_abi.encode(['address', 'uint256'], [self.uni_router_address, amount_wei])
-        v4_swap_input = make_v4_swap_input(
-            token_in=self.weth_address,
-            token_out=token,
-            amount_in=amount_wei,
-            min_out=min_out,
-            recipient=recipient,
-            fee=fee,
-            tick_spacing=tick,
-            hook_addr=hook
+        # This path deliberately skips simulation, so min_out is the only thing
+        # standing between a bad fill and the whole stake.
+        min_out = await self.min_out_for(
+            "UNISWAP_V4", token, ZERO, fee, amount_wei, self.uni_router_address, slippage_pct
         )
-        inputs = [wrap_input, v4_swap_input]
-        deadline = int(time.time()) + 300
+        if min_out is None:
+            logger.error(f"❌ Cannot quote forced V4 buy for {token} -- refusing to send unprotected")
+            return "", 0.0
 
-        calldata = self.uni_router.functions.execute(commands, inputs, deadline)._encode_transaction_data()
+        # Same encoder as the simulated path, so the native-vs-WETH PoolKey is
+        # resolved here too. This used to hardcode WETH and revert on every
+        # native-keyed pool.
+        built_tx, _cmds = await asyncio.to_thread(
+            self.build_v4_swap_tx, token, amount_wei, min_out, recipient, ZERO,
+            fee, tick, hook
+        )
+        calldata = built_tx['data']
 
-        latest = await asyncio.to_thread(self.w3.eth.get_block, 'latest')
-        base_fee = latest.get('baseFeePerGas', self.w3.eth.gas_price)
-        max_priority = max(int(base_fee * 0.1), 1_000_000)
-        max_fee = int(base_fee * 1.35) + max_priority
+        max_fee, max_priority = eip1559_fees(self.w3)
 
         tx = {
             "from": recipient,
@@ -716,6 +939,12 @@ class DexTrader:
             "chainId": 4663
         }
 
+        # Read the balance before broadcasting so the fill can be measured rather
+        # than assumed. This used to return a hardcoded 1.0, which became the
+        # denominator of the position's entry price in main.py:105 -- wrong by
+        # orders of magnitude, so the monitor stop-lossed seconds after entry.
+        bal_before = await self._safe_token_balance(token)
+
         signed = self.chain.account.sign_transaction(tx)
         raw_tx_bytes = getattr(signed, 'raw_transaction', getattr(signed, 'rawTransaction', None))
         tx_hash_bytes = await asyncio.to_thread(self.w3.eth.send_raw_transaction, raw_tx_bytes)
@@ -725,12 +954,16 @@ class DexTrader:
 
         receipt = await self.chain.wait_for_receipt(tx_hash, timeout=45)
         status = receipt.get("status", 0)
-        if status == 1:
-            logger.info(f"⚡ Forced Buy confirmed in block {receipt.get('blockNumber')}")
-            return tx_hash, 1.0
-        else:
+        if status != 1:
             logger.error(f"⚡ Forced Buy reverted: {tx_hash}")
             return tx_hash, 0.0
+
+        received = await self._measure_fill(token, bal_before)
+        logger.info(
+            f"⚡ Forced Buy confirmed in block {receipt.get('blockNumber')}: "
+            f"{received} tokens received"
+        )
+        return tx_hash, received
 
     # ─── Simulation Step (eth_call / eth_estimateGas) ───────────────────
 
@@ -806,19 +1039,86 @@ class DexTrader:
             }
             return tx, "exactInputSingle"
 
+    def _v4_pool_liquidity(self, currency_a: str, currency_b: str, fee: int, tick: int, hook: str) -> int:
+        a, b = self.w3.to_checksum_address(currency_a), self.w3.to_checksum_address(currency_b)
+        c0, c1 = (a, b) if int(a, 16) < int(b, 16) else (b, a)
+        try:
+            pid = pool_id_from_key(c0, c1, int(fee), int(tick), self.w3.to_checksum_address(hook))
+            return int(self.state_view.functions.getLiquidity(pid).call())
+        except Exception:
+            return 0
+
+    def _v4_pool_has_liquidity(self, currency_a: str, currency_b: str, fee: int, tick: int, hook: str) -> bool:
+        a, b = self.w3.to_checksum_address(currency_a), self.w3.to_checksum_address(currency_b)
+        c0, c1 = (a, b) if int(a, 16) < int(b, 16) else (b, a)
+        try:
+            pid = pool_id_from_key(c0, c1, int(fee), int(tick), self.w3.to_checksum_address(hook))
+            return int(self.state_view.functions.getLiquidity(pid).call()) > 0
+        except Exception:
+            return False
+
+    def _resolve_v4_currency_in(self, token_address: str, fee: int, tick: int, hook: str) -> Tuple[str, bool]:
+        """
+        Decide whether the live V4 pool for this token is keyed on native ETH or on WETH.
+
+        Uniswap V4 addresses native ETH as address(0), NOT as WETH. A PoolKey built
+        with WETH and one built with address(0) hash to different poolIds, so keying
+        on the wrong one encodes a swap against a pool that does not exist and the
+        router reverts with a bare 0x — which is exactly what this bot was doing on
+        every V4 buy.
+
+        Ask the chain rather than assuming. Returns (currency_in, needs_wrap);
+        needs_wrap is True only for a genuine WETH-keyed pool, where the Universal
+        Router must WRAP_ETH before the swap.
+        """
+        key = (self.w3.to_checksum_address(token_address), int(fee), int(tick), str(hook).lower())
+        cached = self._v4_currency_cache.get(key)
+        if cached is not None:
+            return cached
+
+        # ponytail: one blocking view call per (token, poolkey), then cached for the
+        # process lifetime. Fine for a sniper; if it ever shows up in entry latency,
+        # resolve it inside detect_venue_and_route (already async + cached) instead.
+        if self._v4_pool_has_liquidity(ZERO, token_address, fee, tick, hook):
+            result = (ZERO, False)
+        elif self._v4_pool_has_liquidity(self.weth_address, token_address, fee, tick, hook):
+            result = (self.weth_address, True)
+        else:
+            # Neither is live at this PoolKey. Native is the far more common shape on
+            # this chain, so prefer it and let the caller's simulation catch the miss.
+            logger.warning(
+                f"No live V4 pool for {token_address} at fee={fee} tick={tick} hook={hook} "
+                f"on either native or WETH key -- defaulting to native"
+            )
+            result = (ZERO, False)
+
+        self._v4_currency_cache[key] = result
+        return result
+
     def build_v4_swap_tx(self, token_address: str, amount_in_wei: int, amount_out_min: int, recipient: str, quote_asset: str, fee: int = 3000, tick: int = 60, hook: str = "0x" + "0"*40) -> Tuple[Dict[str, Any], str]:
         """
-        Single-hop V4 swap WETH -> Token.
+        Single-hop V4 swap ETH -> Token.
+
+        Keys the pool on whichever currency is actually live (native address(0) or
+        WETH) and only emits WRAP_ETH when the pool genuinely wants WETH.
         """
-        v4_swap_input = make_v4_swap_input(self.weth_address, token_address, amount_in_wei, amount_out_min, recipient, fee=fee, tick_spacing=tick, hook_addr=hook)
+        currency_in, needs_wrap = self._resolve_v4_currency_in(token_address, fee, tick, hook)
+
+        v4_swap_input = make_v4_swap_input(currency_in, token_address, amount_in_wei, amount_out_min, recipient, fee=fee, tick_spacing=tick, hook_addr=hook)
         WRAP_ETH = 0x0b
         V4_SWAP  = 0x10
-        commands = bytes([WRAP_ETH, V4_SWAP])
+        deadline = int(time.time()) + 300
 
-        wrap_input = eth_abi.encode(['address', 'uint256'], [self.uni_router_address, amount_in_wei])
-        deadline   = int(time.time()) + 300
+        if needs_wrap:
+            commands = bytes([WRAP_ETH, V4_SWAP])
+            wrap_input = eth_abi.encode(['address', 'uint256'], [self.uni_router_address, amount_in_wei])
+            inputs = [wrap_input, v4_swap_input]
+        else:
+            # Native pool settles ETH straight from msg.value — nothing to wrap.
+            commands = bytes([V4_SWAP])
+            inputs = [v4_swap_input]
 
-        calldata = self.uni_router.functions.execute(commands, [wrap_input, v4_swap_input], deadline)._encode_transaction_data()
+        calldata = self.uni_router.functions.execute(commands, inputs, deadline)._encode_transaction_data()
 
         tx = {
             'from': recipient,
@@ -832,12 +1132,26 @@ class DexTrader:
     def build_v4_usdg_2hop_tx(self, token_address: str, eth_amount_wei: int, amount_out_min: int, recipient: str,
                               fee2: int = 3000, tick2: int = 60, hook2: str = PONS_V2_HOOK) -> Tuple[Dict[str, Any], str]:
         """
-        Multi-hop V4 swap in a SINGLE V4_SWAP command:
-        WRAP_ETH (0x0b) + V4_SWAP (0x10):
-          Action 0x06: WETH -> USDG (amt_in = eth_amount_wei, min_out = 0)
-          Action 0x06: USDG -> Token (amt_in = 0 [OPEN_DELTA], min_out = amount_out_min)
-          Action 0x0c: SETTLE_ALL (WETH, eth_amount_wei)
-          Action 0x0f: TAKE_ALL (Token, amount_out_min)
+        KNOWN BROKEN on chain 4663 — kept for reference, not wired into any live path.
+
+        Intent: one atomic WRAP_ETH + V4_SWAP doing WETH->USDG then USDG->Token via
+        OPEN_DELTA. It has never produced a transaction this chain accepts.
+
+        Measured against live state (eth_estimateGas, 0.0004 ETH, AAPL/USDG):
+          - both hops are fine in isolation: native->USDG estimates at 137k gas, and
+            the V4 quoter prices both legs (0.0004 ETH -> 1.0289 USDG -> AAPL)
+          - chained SWAP_EXACT_IN_SINGLE with OPEN_DELTA  -> DeltaNotPositive(address(0))
+          - same, with an explicit hop-2 amountIn          -> DeltaNotPositive(address(0))
+          - canonical SWAP_EXACT_IN (0x07) path form       -> bare revert
+          - mixed V3_SWAP_EXACT_IN + V4_SWAP in one execute-> bare revert
+          - TAKE-before-SETTLE and SETTLE-between orderings -> revert
+        Action/param alignment is not the issue: a 4-action list with a duplicate
+        TAKE_ALL estimates fine (140k gas).
+
+        The 0x3b99b53d selector the README mentions is SliceOutOfBounds().
+
+        USDG-quoted buys go through StockV4Router.buy_usdg_two_tx instead: two
+        transactions, both using encodings proven to work.
         """
         commands = bytes([0x0b, 0x10])  # WRAP_ETH + single V4_SWAP command
 
@@ -905,7 +1219,8 @@ class DexTrader:
                          quote_asset: str, fee: int = 3000, tick: int = 60, hook: str = "0x" + "0"*40) -> Tuple[Dict[str, Any], str]:
         """
         Builds a V4 sell transaction via Universal Router.
-        Pulls token with PERMIT2 (0x02), swaps via V4_SWAP (0x10), and unwraps WETH to ETH (0x0c).
+        Swaps via V4_SWAP (0x10). The token is pulled by V4's own SETTLE_ALL action
+        through Permit2 -- no separate PERMIT2_TRANSFER_FROM command (see below).
         Supports:
         1. Single-hop: Token -> WETH -> ETH
         2. Two-hop USDG: Token -> USDG -> WETH -> ETH
@@ -914,10 +1229,6 @@ class DexTrader:
         weth_cs = self.weth_address
         usdg_cs = self.usdg_address
 
-        pull_input = eth_abi.encode(
-            ["address", "address", "uint160"],
-            [tok_cs, self.uni_router_address, int(amount_in)]
-        )
         unwrap_input = eth_abi.encode(
             ["address", "uint256"],
             [recipient, int(min_out)]
@@ -956,15 +1267,23 @@ class DexTrader:
             actions = bytes([0x06, 0x06, 0x0c, 0x0f])
             v4_input = eth_abi.encode(['bytes', 'bytes[]'], [actions, [p_hop1, p_hop2, p_settle, p_take]])
 
-            commands = bytes([0x02, 0x10, 0x0c])  # PERMIT2_TRANSFER_FROM + V4_SWAP + UNWRAP_WETH
-            inputs = [pull_input, v4_input, unwrap_input]
+            # No PERMIT2_TRANSFER_FROM here. V4's SETTLE_ALL pulls the token from
+            # the user through Permit2 itself, so pulling it to the router first
+            # made the router pull the same amount TWICE -- which is why selling
+            # more than half the balance reverted with TRANSFER_FROM_FAILED.
+            commands = bytes([0x10, 0x0c])  # V4_SWAP + UNWRAP_WETH
+            inputs = [v4_input, unwrap_input]
         else:
-            # Single-hop V4: Token -> WETH + UNWRAP_WETH
-            if int(tok_cs, 16) < int(weth_cs, 16):
-                c0, c1 = tok_cs, weth_cs
+            # Single-hop V4: Token -> ETH. Same native-vs-WETH PoolKey problem as
+            # the buy side — key on whichever currency the live pool actually uses,
+            # or this reverts against a pool that does not exist.
+            currency_out, pool_wants_weth = self._resolve_v4_currency_in(token_address, fee, tick, hook)
+
+            if int(tok_cs, 16) < int(currency_out, 16):
+                c0, c1 = tok_cs, currency_out
                 z4o = True
             else:
-                c0, c1 = weth_cs, tok_cs
+                c0, c1 = currency_out, tok_cs
                 z4o = False
             pk = (c0, c1, int(fee), int(tick), self.w3.to_checksum_address(hook))
             p_hop = eth_abi.encode(
@@ -972,13 +1291,22 @@ class DexTrader:
                 [pk, z4o, int(amount_in), int(min_out), 0, 0, b'']
             )
             p_settle = eth_abi.encode(['address', 'uint256'], [tok_cs, int(amount_in)])
-            p_take = eth_abi.encode(['address', 'uint256'], [weth_cs, int(min_out)])
+            p_take = eth_abi.encode(['address', 'uint256'], [currency_out, int(min_out)])
 
             actions = bytes([0x06, 0x0c, 0x0f])
             v4_input = eth_abi.encode(['bytes', 'bytes[]'], [actions, [p_hop, p_settle, p_take]])
 
-            commands = bytes([0x02, 0x10, 0x0c])  # PERMIT2_TRANSFER_FROM + V4_SWAP + UNWRAP_WETH
-            inputs = [pull_input, v4_input, unwrap_input]
+            if pool_wants_weth:
+                # Proceeds land as WETH in the router — unwrap to the recipient.
+                commands = bytes([0x10, 0x0c])  # V4_SWAP + UNWRAP_WETH
+                inputs = [v4_input, unwrap_input]
+            else:
+                # TAKE_ALL on a native pool already credits the ETH to the caller,
+                # so there is nothing left in the router to SWEEP. Verified on-chain:
+                # this shape estimates at ~151k gas selling a FULL balance, where the
+                # pull+sweep version reverted with TRANSFER_FROM_FAILED.
+                commands = bytes([0x10])  # V4_SWAP only
+                inputs = [v4_input]
 
         deadline = int(time.time()) + 300
         calldata = self.uni_router.functions.execute(commands, inputs, deadline)._encode_transaction_data()
@@ -992,6 +1320,27 @@ class DexTrader:
         return tx, commands.hex()
 
     # ─── Public Buy / Sell ────────────────────────────────────────────────
+
+    async def _dry_run_fill(self, token_address: str, eth_amount: float) -> float:
+        """
+        Token count for a simulated buy, priced off the real pool.
+
+        Paper mode used to return eth_amount * 1000, which made the entry price
+        (stake / tokens) wrong by orders of magnitude -- so every paper position
+        showed a 0.00x multiplier and instantly stop-lossed. That made DRY_RUN
+        useless for testing the exit ladder, which is the main reason to run it.
+        """
+        try:
+            tokens = await self.estimate_tokens_for_eth(token_address, eth_amount)
+            if tokens and tokens > 0:
+                return float(tokens)
+        except Exception as e:
+            logger.debug(f"Dry-run fill estimate failed for {token_address}: {e}")
+        logger.warning(
+            f"[DRY RUN] No live price for {token_address}; falling back to a nominal "
+            f"fill. The ladder will not behave realistically for this position."
+        )
+        return eth_amount * 1000.0
 
     async def buy_token(self, token_address: str, eth_amount: float, slippage_pct: float, start_time: Optional[float] = None) -> Tuple[str, float]:
         if start_time is None:
@@ -1018,7 +1367,10 @@ class DexTrader:
             except Exception as e:
                 logger.warning(f"stock_v4.detect skipped/timed out: {e}")
                 info = {}
-            if info.get("venue") != "NONE":
+            # info is {} when detect() times out. {}.get("venue") is None, which is
+            # not "NONE", so this branch used to be entered and then KeyError on
+            # info["venue"] -- killing the trade on every detect timeout.
+            if info.get("venue", "NONE") != "NONE":
                 venue = info["venue"]
                 quote_asset = info.get("quote", ZERO)
                 target_addr = info.get("target", ZERO)
@@ -1036,9 +1388,9 @@ class DexTrader:
                     log_line = f"{ms}ms | {token_address} | {venue} | {target_addr} | sent=False (DRY_RUN) | tx=DRY_RUN_0x{int(time.time())} | status=1 | token_delta=+{eth_amount*1000:,.4f} | quote_delta=-{eth_amount:.6f}"
                     logger.info(log_line)
                     print(log_line)
-                    return f"DRY_RUN_0x{int(time.time())}", eth_amount * 1000.0
+                    return f"DRY_RUN_0x{int(time.time())}", await self._dry_run_fill(token_address, eth_amount)
 
-                bal_before = await self.chain.get_token_balance(token_address)
+                bal_before = await self._safe_token_balance(token_address)
                 tx_hash = None
                 try:
                     tx_res = await asyncio.to_thread(self.stock_v4.buy, token_address, eth_amount)
@@ -1056,7 +1408,8 @@ class DexTrader:
                             logger.info(f"USDG V4 two-tx buy for {token_address} fee={v4_fee} tick={v4_tick}")
                             res = await asyncio.to_thread(
                                 self.stock_v4.buy_usdg_two_tx,
-                                token_address, eth_amount, v4_fee, v4_tick, v4_hook
+                                token_address, eth_amount, v4_fee, v4_tick, v4_hook,
+                                self.usdg_leg_min_out(token_address, v4_fee, v4_tick, v4_hook, slippage_pct)
                             )
                         else:
                             res = await asyncio.to_thread(
@@ -1070,8 +1423,7 @@ class DexTrader:
 
                 if tx_hash:
                     receipt = await self.chain.wait_for_receipt(tx_hash)
-                    bal_after = await self.chain.get_token_balance(token_address)
-                    tokens_received = bal_after - bal_before
+                    tokens_received = await self._measure_fill(token_address, bal_before)
                     status = receipt.get("status", 0)
                     ms = int((time.time() - start_time) * 1000)
                     log_line = f"{ms}ms | {token_address} | {venue} | {target_addr} | sent=True | tx={tx_hash} | status={status} | token_delta={tokens_received:+,.4f} | quote_delta=-{eth_amount:.6f}"
@@ -1090,65 +1442,75 @@ class DexTrader:
                 print(log_line)
                 return "", 0.0
 
-        min_out = 1
-
         if getattr(self.config, "DRY_RUN", True):
             ms = int((time.time() - start_time) * 1000)
             log_line = f"{ms}ms | {token_address} | {venue} | {target_addr} | sent=False (DRY_RUN) | tx=DRY_RUN_0x{int(time.time())} | status=1 | token_delta=+{eth_amount*1000:,.4f} | quote_delta=-{eth_amount:.6f}"
             logger.info(log_line)
             print(log_line)
-            return f"DRY_RUN_0x{int(time.time())}", eth_amount * 1000.0
+            return f"DRY_RUN_0x{int(time.time())}", await self._dry_run_fill(token_address, eth_amount)
+
+        min_out = await self.min_out_for(
+            venue, token_address, quote_asset, fee, eth_wei, target_addr, slippage_pct
+        )
+        if min_out is None:
+            # No quote means no slippage protection. Sending anyway is how you get
+            # sandwiched for the full stake, so skip the trade instead.
+            logger.error(
+                f"❌ Cannot quote {venue} route for {token_address} -- refusing to buy "
+                f"without slippage protection"
+            )
+            return "", 0.0
 
         if venue in ["V4", "STOCK_PAIR", "V4_STOCK"]:
-            cached_params = self._v4_pool_params_cache.get(token_address, {})
-            v4_tick = cached_params.get("tick", 60)
-            v4_hook = cached_params.get("hook", "0x" + "0"*40)
+            v4_fee, v4_tick, v4_hook = await asyncio.to_thread(
+                self._v4_params_for, token_address, quote_asset, fee)
             return await self.force_buy_v4_or_stock(
                 token_address, eth_amount, slippage_pct,
-                fee=fee, tick=v4_tick, hook=v4_hook
+                fee=v4_fee, tick=v4_tick, hook=v4_hook
             )
 
         candidate_txs = []
 
         # Handle UNISWAP_V4 from stock_v4 fallback (includes USDG & stock quotes)
         if venue == "UNISWAP_V4":
-            cached_params = self._v4_pool_params_cache.get(token_address, {})
-            default_tick = 200 if quote_asset.lower() != self.weth_address.lower() else 60
-            default_hook = PONS_V2_HOOK if quote_asset.lower() != self.weth_address.lower() else ("0x" + "0"*40)
-            v4_tick = cached_params.get("tick", default_tick)
-            v4_hook = cached_params.get("hook", default_hook)
+            # Resolve against live pool state instead of guessing from defaults —
+            # the guess is what made V4 buys target pools that do not exist.
+            v4_fee_resolved, v4_tick, v4_hook = await asyncio.to_thread(
+                self._v4_params_for, token_address, quote_asset, fee)
+            fee = v4_fee_resolved
 
             if quote_asset.lower() == self.usdg_address.lower():
                 # Prefer two-tx ETH->USDG->token to avoid 0x3b99b53d hybrid encode
                 try:
                     if not getattr(self.config, "DRY_RUN", True):
-                        bal_before = await self.chain.get_token_balance(token_address)
+                        bal_before = await self._safe_token_balance(token_address)
                         res = await asyncio.to_thread(
                             self.stock_v4.buy_usdg_two_tx,
-                            token_address, eth_amount, fee if fee is not None else 3000, v4_tick, v4_hook
+                            token_address, eth_amount, fee if fee is not None else 3000, v4_tick, v4_hook,
+                            self.usdg_leg_min_out(token_address, fee if fee is not None else 3000, v4_tick, v4_hook, slippage_pct)
                         )
                         tx2 = res[1] if isinstance(res, tuple) else res
                         if tx2:
                             receipt = await self.chain.wait_for_receipt(tx2)
-                            bal_after = await self.chain.get_token_balance(token_address)
-                            got = bal_after - bal_before
+                            got = await self._measure_fill(token_address, bal_before)
                             if receipt.get("status", 0) == 1 and got > 0:
                                 return tx2, got
                 except Exception as e:
-                    logger.warning(f"buy_usdg_two_tx failed, falling back to encoded 2hop: {e}")
-                tx, cmd = self.build_v4_usdg_2hop_tx(
-                    token_address, eth_wei, min_out, recipient,
-                    fee2=fee if fee is not None and int(fee) >= 0 else 3000,
-                    tick2=v4_tick,
-                    hook2=v4_hook
+                    logger.warning(f"buy_usdg_two_tx failed for {token_address}: {e}")
+                # No atomic fallback here on purpose. build_v4_usdg_2hop_tx has never
+                # produced a transaction this chain accepts -- see the note on that
+                # method. Queuing it only wasted a simulation round-trip and then
+                # dropped through to the generic fallbacks anyway, so go there directly.
+                logger.warning(
+                    f"No single-tx V4 route exists for USDG-quoted {token_address}; "
+                    f"deferring to fallback detection"
                 )
-                candidate_txs.append((venue, self.uni_router_address, tx, cmd))
             elif self.w3.to_checksum_address(quote_asset) in EXTENDED_STOCK_LIST or quote_asset.lower() not in (self.weth_address.lower(), ZERO.lower(), "0x0000000000000000000000000000000000000000"):
                 if getattr(self.config, "DRY_RUN", True):
-                    return f"DRY_RUN_0x{int(time.time())}", eth_amount * 1000.0
+                    return f"DRY_RUN_0x{int(time.time())}", await self._dry_run_fill(token_address, eth_amount)
                 tick = v4_tick
                 hook = v4_hook
-                bal_before = await self.chain.get_token_balance(token_address)
+                bal_before = await self._safe_token_balance(token_address)
                 tx2 = None
                 last_err = None
                 # Two-leg buy (ETH->STOCK, then STOCK->TOKEN) has more failure
@@ -1181,8 +1543,7 @@ class DexTrader:
                     await self.chain.wait_for_receipt(tx2)
                 except Exception as e:
                     logger.warning(f"Could not confirm stock-leg buy receipt for {token_address}: {e}")
-                bal_after = await self.chain.get_token_balance(token_address)
-                tokens_received = bal_after - bal_before
+                tokens_received = await self._measure_fill(token_address, bal_before)
                 return tx2, tokens_received if tokens_received > 0 else 0.0
             else:
                 tx_v4, cmd_v4 = self.build_v4_swap_tx(
@@ -1237,10 +1598,7 @@ class DexTrader:
         }
 
         for v_name, target, tx, cmd_str in candidate_txs:
-            latest = await asyncio.to_thread(self.w3.eth.get_block, 'latest')
-            base_fee = latest.get('baseFeePerGas', self.w3.eth.gas_price)
-            tx['maxFeePerGas'] = int(base_fee * 1.25)
-            tx['maxPriorityFeePerGas'] = max(int(base_fee * 0.1), 1_000_000)
+            tx['maxFeePerGas'], tx['maxPriorityFeePerGas'] = eip1559_fees(self.w3)
             tx['gas'] = gas_limits.get(v_name, 350000)
 
             skip_sim = (v_name in self.no_sim_venues)
@@ -1260,14 +1618,13 @@ class DexTrader:
                 logger.info(f"⚡ NO-SIM FAST BROADCAST for {v_name} (proven venue)")
 
             # Query balance BEFORE transaction to ensure clean delta check
-            bal_before = await self.chain.get_token_balance(token_address)
+            bal_before = await self._safe_token_balance(token_address)
 
             tx_hash = await self.chain.send_transaction(tx)
             receipt = await self.chain.wait_for_receipt(tx_hash)
 
             # Query balance AFTER transaction receipt
-            bal_after = await self.chain.get_token_balance(token_address)
-            tokens_received = bal_after - bal_before
+            tokens_received = await self._measure_fill(token_address, bal_before)
             status = receipt.get("status", 0)
 
             ms = int((time.time() - start_time) * 1000)
@@ -1297,38 +1654,46 @@ class DexTrader:
                 fb_quote = info.get("quote", ZERO)
                 fb_target = info.get("target", ZERO)
                 fb_fee = info.get("fee", 0)
-                cached_params = self._v4_pool_params_cache.get(token_address, {})
-                fb_tick = info.get("tick") or cached_params.get("tick", 60)
-                fb_hook = info.get("hook") or cached_params.get("hook", ZERO)
+                fb_fee_resolved, fb_tick, fb_hook = await asyncio.to_thread(
+                    self._v4_params_for, token_address, fb_quote, fb_fee)
+                fb_fee = fb_fee_resolved
                 logger.info(f"Fallback detected: {fb_venue} | Target: {fb_target} | Quote: {fb_quote}")
 
                 if fb_venue == "UNISWAP_V4":
                     if fb_quote.lower() in (self.weth_address.lower(), ZERO.lower(), "0x0000000000000000000000000000000000000000"):
-                        tx_hash, _ = await self.force_buy_v4_or_stock(
+                        # force_buy_v4_or_stock measures its own fill now, so pass
+                        # its result straight through instead of inventing one.
+                        tx_hash, received = await self.force_buy_v4_or_stock(
                             token_address, eth_amount, slippage_pct,
                             fee=fb_fee, tick=fb_tick, hook=fb_hook
                         )
-                        if tx_hash:
-                            return tx_hash, eth_amount * 1000.0
+                        if tx_hash and received > 0:
+                            return tx_hash, received
                     elif fb_quote.lower() == self.usdg_address.lower():
-                        tx_fb, _ = self.build_v4_usdg_2hop_tx(
-                            token_address, eth_wei, min_out, recipient,
-                            fee2=fb_fee, tick2=fb_tick, hook2=fb_hook
-                        )
+                        # Two transactions, not one atomic encode — the atomic V4
+                        # USDG route does not work on this chain (see
+                        # build_v4_usdg_2hop_tx). Measure the real balance delta
+                        # rather than reporting an assumed token count.
                         try:
-                            gas_est = await asyncio.to_thread(self.w3.eth.estimate_gas, tx_fb)
-                            tx_fb['gas'] = int(gas_est * 1.2)
-                            tx_hash = await self.chain.send_transaction(tx_fb)
-                            receipt = await self.chain.wait_for_receipt(tx_hash)
-                            if receipt.get("status") == 1:
-                                return tx_hash, eth_amount * 1000.0
+                            fb_bal_before = await self._safe_token_balance(token_address)
+                            res = await asyncio.to_thread(
+                                self.stock_v4.buy_usdg_two_tx,
+                                token_address, eth_amount, fb_fee, fb_tick, fb_hook,
+                                self.usdg_leg_min_out(token_address, fb_fee, fb_tick, fb_hook, slippage_pct)
+                            )
+                            tx_hash = res[1] if isinstance(res, tuple) else res
+                            if tx_hash:
+                                await self.chain.wait_for_receipt(tx_hash)
+                                got = await self.chain.get_token_balance(token_address) - fb_bal_before
+                                if got > 0:
+                                    return tx_hash, got
                         except Exception as e:
-                            logger.warning(f"Fallback V4 USDG sim failed: {e}")
+                            logger.warning(f"Fallback USDG two-tx buy failed: {e}")
                     else:
                         # Stock quote fallback
                         if getattr(self.config, "DRY_RUN", True):
-                            return f"DRY_RUN_0x{int(time.time())}", eth_amount * 1000.0
-                        fb_bal_before = await self.chain.get_token_balance(token_address)
+                            return f"DRY_RUN_0x{int(time.time())}", await self._dry_run_fill(token_address, eth_amount)
+                        fb_bal_before = await self._safe_token_balance(token_address)
                         try:
                             tx1, tx2 = await asyncio.to_thread(
                                 self.stock_v4.buy_stock_two_tx,
@@ -1342,26 +1707,38 @@ class DexTrader:
                                 await self.chain.wait_for_receipt(tx2)
                             except Exception as e:
                                 logger.warning(f"Could not confirm fallback stock-leg receipt for {token_address}: {e}")
-                            fb_bal_after = await self.chain.get_token_balance(token_address)
-                            fb_tokens_received = fb_bal_after - fb_bal_before
+                            fb_tokens_received = await self._measure_fill(token_address, fb_bal_before)
                             return tx2, fb_tokens_received if fb_tokens_received > 0 else 0.0
                         except Exception as e:
                             logger.warning(f"Stock two-tx fallback failed: {e}")
 
                 elif fb_venue.startswith("UNISWAP_V2"):
-                    calldata = self.v2_router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
-                        min_out, [self.weth_address, token_address], recipient, int(time.time()) + 300
-                    )._encode_transaction_data()
-                    tx_v2 = {'from': recipient, 'to': UNISWAP_V2_ROUTER, 'value': eth_wei, 'data': calldata, 'chainId': 4663}
-                    try:
-                        gas_est = await asyncio.to_thread(self.w3.eth.estimate_gas, tx_v2)
-                        tx_v2['gas'] = int(gas_est * 1.2)
-                        tx_hash = await self.chain.send_transaction(tx_v2)
-                        receipt = await self.chain.wait_for_receipt(tx_hash)
-                        if receipt.get("status") == 1:
-                            return tx_hash, eth_amount * 1000.0
-                    except Exception as e:
-                        logger.warning(f"Fallback V2 sim failed: {e}")
+                    # Re-quote for the route actually being taken. min_out was
+                    # computed for the originally detected venue, and a floor from a
+                    # different pool is either too strict (reverts) or too loose.
+                    v2_min_out = await self.min_out_for(
+                        fb_venue, token_address, self.weth_address, 0, eth_wei,
+                        UNISWAP_V2_ROUTER, slippage_pct
+                    )
+                    if v2_min_out is None:
+                        logger.error(f"Cannot quote V2 fallback for {token_address}; skipping")
+                    else:
+                        calldata = self.v2_router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
+                            v2_min_out, [self.weth_address, token_address], recipient, int(time.time()) + 300
+                        )._encode_transaction_data()
+                        tx_v2 = {'from': recipient, 'to': UNISWAP_V2_ROUTER, 'value': eth_wei, 'data': calldata, 'chainId': 4663}
+                        try:
+                            gas_est = await asyncio.to_thread(self.w3.eth.estimate_gas, tx_v2)
+                            tx_v2['gas'] = int(gas_est * 1.2)
+                            v2_bal_before = await self._safe_token_balance(token_address)
+                            tx_hash = await self.chain.send_transaction(tx_v2)
+                            receipt = await self.chain.wait_for_receipt(tx_hash)
+                            if receipt.get("status") == 1:
+                                received = await self._measure_fill(token_address, v2_bal_before)
+                                if received > 0:
+                                    return tx_hash, received
+                        except Exception as e:
+                            logger.warning(f"Fallback V2 sim failed: {e}")
         except Exception as e:
             logger.warning(f"Fallback detection failed: {e}")
 
@@ -1370,9 +1747,9 @@ class DexTrader:
         # ==========================================
         logger.warning(f"All simulated routes failed for {token_address}. Attempting no-sim V4 last resort...")
         try:
-            tx_hash, _ = await self.force_buy_v4_or_stock(token_address, eth_amount, slippage_pct)
-            if tx_hash:
-                return tx_hash, eth_amount * 1000.0
+            tx_hash, received = await self.force_buy_v4_or_stock(token_address, eth_amount, slippage_pct)
+            if tx_hash and received > 0:
+                return tx_hash, received
         except Exception as e:
             logger.error(f"No-sim V4 last resort failed: {e}")
 
@@ -1403,18 +1780,70 @@ class DexTrader:
             decimals = 18
 
         amount_in = int(token_amount * (10**decimals))
-        min_out = 1
+
+        # Clamp to the real on-chain balance BEFORE choosing a venue, so EVERY
+        # route gets it. position.remaining_tokens is a float; float64 holds ~16
+        # significant digits against a 22-digit raw balance, so amount_in can come
+        # out ABOVE what the wallet holds. Seen twice live: 637,541 wei over on
+        # KELLYOW (V4), and 964,804 wei over on a curve-quoted token which kept
+        # failing ERC20InsufficientBalance because this clamp was nested inside the
+        # V4 branch and every other venue skipped it.
+        bal_before = await self.chain.get_token_balance(token_address)
+        live_raw = await self.chain.get_token_balance_raw(token_address)
+        if live_raw <= 0:
+            logger.error(f"Cannot sell {token_address}: wallet holds none of it")
+            return "", 0.0
+        if amount_in > live_raw:
+            # Never ask for more than the wallet holds. Either the caller meant
+            # "all of it" and float precision overshot, or the balance moved.
+            logger.info(
+                f"Clamping sell of {token_address}: asked {amount_in}, "
+                f"wallet holds {live_raw} (over by {amount_in - live_raw})"
+            )
+            amount_in = live_raw
+        elif abs(live_raw - amount_in) <= max(1, live_raw // 1_000_000):
+            # Within a rounding hair of the whole balance: sell exactly all of it
+            # so no dust is stranded and the position closes cleanly.
+            amount_in = live_raw
+        # min_out is quoted from amount_in below, so the clamped size gets the
+        # correct floor automatically -- nothing to scale here.
+
+        min_out = await self.min_out_for(
+            venue, token_address, quote_asset, fee, amount_in, target_addr,
+            slippage_pct, selling=True
+        )
+        if min_out is None:
+            # Refuse rather than dump the bag at any price. The monitor retries on
+            # the next poll (position_monitor.py:37), so a transient quoter failure
+            # delays the exit instead of giving the position away.
+            logger.error(
+                f"❌ Cannot quote sell route {venue} for {token_address} -- refusing to "
+                f"sell without slippage protection; will retry"
+            )
+            return "", 0.0
 
         if venue in ("UNISWAP_V4", "NONE"):
             v4_fee, v4_tick, v4_hook = self._v4_params_for(token_address, quote_asset, fee)
+            # The resolver may have settled on a different (working) pool than the
+            # one detection named -- build and quote against that one.
+            quote_asset = self.v4_resolved_quote(token_address, quote_asset)
+
+            # sell_to_eth still keys its PoolKey on WETH and appends UNWRAP_WETH, so
+            # on this chain's native-keyed pools it always reverts and costs a
+            # round trip before the real path runs. build_v4_sell_tx handles the
+            # ETH-quoted case correctly (verified on-chain), so only fall back to
+            # sell_to_eth for the stock/USDG multi-hop exits it uniquely handles.
+            quote_is_ethish = quote_asset.lower() in (
+                self.weth_address.lower(), ZERO.lower(),
+                "0x0000000000000000000000000000000000000000")
+
             try:
-                bal_before = await self.chain.get_token_balance(token_address)
-                live_raw = int(bal_before * (10 ** decimals))
-                if live_raw > 0:
-                    amount_in = min(amount_in, live_raw)
+                if quote_is_ethish:
+                    raise RuntimeError("ETH-quoted: using build_v4_sell_tx directly")
                 txh = await asyncio.to_thread(
                     self.stock_v4.sell_to_eth,
-                    token_address, amount_in, v4_fee, v4_tick, v4_hook, quote_asset
+                    token_address, amount_in, v4_fee, v4_tick, v4_hook, quote_asset,
+                    min_out
                 )
                 if txh:
                     receipt = await self.chain.wait_for_receipt(txh)
@@ -1535,10 +1964,7 @@ class DexTrader:
             "UNISWAP_V4": 450000,
         }
 
-        latest = await asyncio.to_thread(self.w3.eth.get_block, 'latest')
-        base_fee = latest.get('baseFeePerGas', self.w3.eth.gas_price)
-        tx['maxFeePerGas'] = int(base_fee * 1.25)
-        tx['maxPriorityFeePerGas'] = max(int(base_fee * 0.1), 1_000_000)
+        tx['maxFeePerGas'], tx['maxPriorityFeePerGas'] = eip1559_fees(self.w3)
         tx['gas'] = gas_limits.get(venue, 350000)
 
         skip_sim = (venue in self.no_sim_venues)
@@ -1573,6 +1999,231 @@ class DexTrader:
                 logger.critical(f"🚨 KILL-SWITCH TRIGGERED on {venue} sell! Status={status}, Sold={tokens_sold}. Re-enabling simulation.")
                 print(f"🚨 KILL-SWITCH TRIGGERED on {venue} sell! Status={status}, Sold={tokens_sold}. Re-enabling simulation.")
             return tx_hash, 0.0
+
+    # ─── Slippage protection ─────────────────────────────────────────────
+    #
+    # Every swap in this file used to go out with min_out = 1 wei, which is not
+    # 15% slippage — it is none at all. Any output above zero was accepted, so a
+    # sandwich could take essentially the whole trade and a thin pool would fill
+    # at any price instead of reverting. SLIPPAGE_PCT was threaded through every
+    # signature and never used to compute anything.
+    #
+    # These quote the route on live pool state (which prices in impact, unlike the
+    # slot0 spot price) and floor the output by the configured tolerance.
+
+    @staticmethod
+    def _apply_slippage(expected_out: int, slippage_pct: float) -> int:
+        pct = max(0.0, min(float(slippage_pct), 100.0))
+        return max(1, int(int(expected_out) * (100.0 - pct) / 100.0))
+
+    def _quote_v3(self, token_in: str, token_out: str, amount_in: int, fee: int,
+                  via: Optional[str] = None) -> Optional[int]:
+        cs = self.w3.to_checksum_address
+        try:
+            if via:
+                path = encode_v3_path([cs(token_in), cs(via), cs(token_out)], [500, int(fee)])
+                return int(self.v3_quoter.functions.quoteExactInput(path, int(amount_in)).call()[0])
+            return int(self.v3_quoter.functions.quoteExactInputSingle(
+                (cs(token_in), cs(token_out), int(amount_in), int(fee), 0)).call()[0])
+        except Exception as e:
+            logger.debug(f"V3 quote failed {token_in}->{token_out} fee={fee} via={via}: {e}")
+            return None
+
+    def _quote_v4(self, token_in: str, token_out: str, amount_in: int,
+                  fee: int, tick: int, hook: str) -> Optional[int]:
+        cs = self.w3.to_checksum_address
+        a, b = cs(token_in), cs(token_out)
+        c0, c1 = (a, b) if int(a, 16) < int(b, 16) else (b, a)
+        try:
+            return int(self.v4_quoter.functions.quoteExactInputSingle(
+                ((c0, c1, int(fee), int(tick), cs(hook)), c0.lower() == a.lower(),
+                 int(amount_in), b'')).call()[0])
+        except Exception as e:
+            logger.debug(f"V4 quote failed {a}->{b} fee={fee} tick={tick}: {e}")
+            return None
+
+    def _quote_v2(self, token_in: str, token_out: str, amount_in: int) -> Optional[int]:
+        cs = self.w3.to_checksum_address
+        try:
+            amounts = self.v2_router.functions.getAmountsOut(
+                int(amount_in), [cs(token_in), cs(token_out)]).call()
+            return int(amounts[-1])
+        except Exception as e:
+            logger.debug(f"V2 quote failed {token_in}->{token_out}: {e}")
+            return None
+
+    def _quote_curve(self, curve_address: str, amount_in: int, token_is_out: bool) -> Optional[int]:
+        """
+        Bonding curves have no quoter, so price the swap off the pair reserves that
+        get_token_price_eth already reads (selector 0x0902f1ac).
+
+        ponytail: assumes constant product with no fee, so it can over-estimate the
+        output on a curve that is not x*y=k. That direction is safe — it makes
+        min_out stricter, never looser — but a curve-specific quote would be tighter.
+        """
+        try:
+            res = self.w3.eth.call({'to': self.w3.to_checksum_address(curve_address),
+                                    'data': '0x0902f1ac'})
+            raw = res.hex()
+            if len(raw) < 128:
+                return None
+            r_quote, r_token = int(raw[:64], 16), int(raw[64:128], 16)
+            r_in, r_out = (r_quote, r_token) if token_is_out else (r_token, r_quote)
+            if r_in <= 0 or r_out <= 0:
+                return None
+            return int((int(amount_in) * r_out) // (r_in + int(amount_in)))
+        except Exception as e:
+            logger.debug(f"Curve quote failed {curve_address}: {e}")
+            return None
+
+    def _quote_route(self, venue: str, token_address: str, quote_asset: str, fee: int,
+                     amount_in: int, target_addr: str, selling: bool) -> Optional[int]:
+        """
+        Expected output for one swap along the route `venue` describes.
+        Returns None when the route cannot be quoted — callers must refuse to
+        trade rather than fall back to an unprotected min_out.
+        """
+        cs = self.w3.to_checksum_address
+        token, weth, usdg = cs(token_address), self.weth_address, self.usdg_address
+
+        if "CURVE" in venue:
+            return self._quote_curve(target_addr, amount_in, token_is_out=not selling)
+
+        if "UNISWAP_V2" in venue:
+            other = usdg if quote_asset.lower() == usdg.lower() else weth
+            return self._quote_v2(token, other, amount_in) if selling else self._quote_v2(other, token, amount_in)
+
+        if "UNISWAP_V3" in venue or venue in ("STOCK_PAIR", "UNISWAP_V3_STOCK"):
+            if quote_asset.lower() == usdg.lower():
+                return (self._quote_v3(token, weth, amount_in, fee, via=usdg) if selling
+                        else self._quote_v3(weth, token, amount_in, fee, via=usdg))
+            return (self._quote_v3(token, weth, amount_in, fee) if selling
+                    else self._quote_v3(weth, token, amount_in, fee))
+
+        if "V4" in venue:
+            v4_fee, v4_tick, v4_hook = self._v4_params_for(token, quote_asset, fee)
+            resolved_q = self.v4_resolved_quote(token, quote_asset)
+            if resolved_q.lower() in (weth.lower(), ZERO.lower()):
+                other, _wrap = self._resolve_v4_currency_in(token, v4_fee, v4_tick, v4_hook)
+            else:
+                other = cs(resolved_q)
+            return (self._quote_v4(token, other, amount_in, v4_fee, v4_tick, v4_hook) if selling
+                    else self._quote_v4(other, token, amount_in, v4_fee, v4_tick, v4_hook))
+
+        return None
+
+    async def min_out_for(self, venue: str, token_address: str, quote_asset: str, fee: int,
+                          amount_in: int, target_addr: str, slippage_pct: float,
+                          selling: bool = False) -> Optional[int]:
+        """Quote the route and floor it by slippage. None means 'do not trade'."""
+        expected = await asyncio.to_thread(
+            self._quote_route, venue, token_address, quote_asset, fee,
+            amount_in, target_addr, selling
+        )
+        if not expected or expected <= 0:
+            return None
+        floor = self._apply_slippage(expected, slippage_pct)
+        logger.info(
+            f"{'SELL' if selling else 'BUY'} quote {venue} {token_address}: expected "
+            f"{expected}, min_out {floor} at {slippage_pct}% slippage"
+        )
+        return floor
+
+    # ─── Fill measurement ────────────────────────────────────────────────
+    #
+    # Several buy paths used to report an invented token count -- a hardcoded 1.0,
+    # or eth_amount * 1000. main.py:105 divides the stake by that number to get the
+    # entry price, so a fabricated count produced an entry price wrong by orders of
+    # magnitude, and position_monitor then stop-lossed the position within seconds.
+    # Always measure the balance delta instead.
+
+    async def _safe_token_balance(self, token_address: str) -> Optional[float]:
+        """
+        Balance read that never raises. Used around a broadcast, where an exception
+        would abandon a position the wallet has already paid for.
+        """
+        for attempt in range(3):
+            try:
+                return await self.chain.get_token_balance(token_address)
+            except Exception as e:
+                logger.warning(f"Balance read failed for {token_address} ({attempt + 1}/3): {e}")
+                await asyncio.sleep(0.5 * (attempt + 1))
+        return None
+
+    async def _measure_fill(self, token_address: str, bal_before: Optional[float]) -> float:
+        """
+        Tokens actually delivered by a buy.
+
+        The ETH is already spent by the time this runs, so it retries rather than
+        giving up: main.py:99 discards any position reporting <= 0 tokens, which
+        would leave a funded bag on-chain with no exit ladder and no stop loss.
+        """
+        after = await self._safe_token_balance(token_address)
+        if after is None:
+            logger.critical(
+                f"Bought {token_address} but the balance is unreadable -- the position "
+                f"cannot be sized or monitored. Check this wallet manually."
+            )
+            return 0.0
+        if bal_before is None:
+            # Starting balance unknown. Size from the full balance: the strategy
+            # engine already refuses a second position in the same token
+            # (strategy_engine.py:86), so a pre-existing balance is unlikely, and an
+            # unmonitored funded position is the worse failure of the two.
+            logger.critical(
+                f"Pre-trade balance for {token_address} was unreadable; sizing from the "
+                f"full balance {after}. Verify manually."
+            )
+            return float(after)
+        return max(0.0, float(after) - float(bal_before))
+
+    def usdg_leg_min_out(self, token_address: str, fee: int, tick: int, hook: str,
+                         slippage_pct: float):
+        """
+        Callback for buy_usdg_two_tx: leg 2's input is only known after leg 1
+        settles, so quote it then. Returns 0 when unquotable, which makes the
+        caller abort rather than swap unprotected.
+        """
+        def _fn(usdg_amount: int) -> int:
+            expected = self._quote_v4(self.usdg_address, token_address, usdg_amount, fee, tick, hook)
+            return self._apply_slippage(expected, slippage_pct) if expected else 0
+        return _fn
+
+    async def _resolve_v3_pool(self, token_address: str, quote_asset: str, fee: int) -> Optional[str]:
+        """
+        Find the real V3 pool for token/quote by asking the factory.
+
+        Do NOT trust the `target` that detect_venue_and_route returns for pricing.
+        The on-chain branch puts the pool address there (check_v3_pool), but the
+        DexScreener branch puts SwapRouter02 there for every V3 venue
+        (stock_v4_routes.py:256-261). Pricing that trusts `target` ends up calling
+        slot0() on the router, which reverts on every poll -- get_token_price_eth
+        then falls through to 0.0, and position_monitor.py:78-80 skips the tick
+        entirely, so TP/SL never fire for that position.
+
+        Mirrors what the UNISWAP_V2 pricing branch already does correctly.
+        """
+        token_cs = self.w3.to_checksum_address(token_address)
+        quote_cs = self.w3.to_checksum_address(quote_asset)
+        cached = self._v3_pool_cache.get((token_cs, quote_cs))
+        if cached:
+            return cached
+
+        tried = []
+        for candidate in ([int(fee)] if fee else []) + [3000, 10000, 500, 100]:
+            if candidate in tried:
+                continue
+            tried.append(candidate)
+            try:
+                pool = await asyncio.to_thread(
+                    self.v3_factory.functions.getPool(quote_cs, token_cs, candidate).call
+                )
+            except Exception:
+                continue
+            if pool and int(pool, 16) != 0:
+                self._v3_pool_cache[(token_cs, quote_cs)] = pool
+                return pool
+        return None
 
     async def get_token_price_eth(self, token_address: str) -> float:
         """
@@ -1609,7 +2260,10 @@ class DexTrader:
                         return price_usdg / eth_price_usd if eth_price_usd > 0 else 0.0
 
             elif venue == "UNISWAP_V3_WETH":
-                pool_contract = self.w3.eth.contract(address=target_addr, abi=[
+                pool_addr = await self._resolve_v3_pool(token_cs, quote_asset, fee)
+                if not pool_addr:
+                    raise ValueError(f"no V3 pool for {token_cs}/{quote_asset}")
+                pool_contract = self.w3.eth.contract(address=pool_addr, abi=[
                     {'inputs': [], 'name': 'slot0', 'outputs': [{'name': 'sqrtPriceX96', 'type': 'uint160'}, {'name': 'tick', 'type': 'int24'}], 'stateMutability': 'view', 'type': 'function'},
                     {'inputs': [], 'name': 'token0', 'outputs': [{'name': '', 'type': 'address'}], 'stateMutability': 'view', 'type': 'function'},
                     {'inputs': [], 'name': 'token1', 'outputs': [{'name': '', 'type': 'address'}], 'stateMutability': 'view', 'type': 'function'}
@@ -1632,7 +2286,10 @@ class DexTrader:
                     return price_in_eth
 
             elif venue == "UNISWAP_V3_USDG":
-                pool_contract = self.w3.eth.contract(address=target_addr, abi=[
+                pool_addr = await self._resolve_v3_pool(token_cs, quote_asset, fee)
+                if not pool_addr:
+                    raise ValueError(f"no V3 pool for {token_cs}/{quote_asset}")
+                pool_contract = self.w3.eth.contract(address=pool_addr, abi=[
                     {'inputs': [], 'name': 'slot0', 'outputs': [{'name': 'sqrtPriceX96', 'type': 'uint160'}, {'name': 'tick', 'type': 'int24'}], 'stateMutability': 'view', 'type': 'function'},
                     {'inputs': [], 'name': 'token0', 'outputs': [{'name': '', 'type': 'address'}], 'stateMutability': 'view', 'type': 'function'},
                     {'inputs': [], 'name': 'token1', 'outputs': [{'name': '', 'type': 'address'}], 'stateMutability': 'view', 'type': 'function'}
@@ -1656,11 +2313,15 @@ class DexTrader:
                     return price_usdg / eth_price_usd if eth_price_usd > 0 else 0.0
 
             elif venue == "UNISWAP_V4":
-                cached_params = self._v4_pool_params_cache.get(token_cs, {})
-                fee_val = fee if fee else cached_params.get("fee", 0)
-                tick_val = cached_params.get("tick", 200 if quote_asset.lower() != self.weth_address.lower() else 60)
-                hook_val = cached_params.get("hook", PONS_V2_HOOK if quote_asset.lower() != self.weth_address.lower() else ZERO)
-                q_cs = self.w3.to_checksum_address(quote_asset)
+                # Same resolved key the buy and sell paths use. Guessing here meant
+                # a wrong key produced sqrtPrice=0, price 0.0, and a skipped tick.
+                fee_val, tick_val, hook_val = await asyncio.to_thread(
+                    self._v4_params_for, token_cs, quote_asset, fee)
+                # Use the quote that actually verified, not the one detection
+                # reported — they differ whenever a native pool was reported as WETH.
+                q_cs = self.w3.to_checksum_address(
+                    self._v4_pool_params_cache.get(token_cs, {}).get("quote") or quote_asset
+                )
 
                 if int(token_cs, 16) < int(q_cs, 16):
                     c0, c1 = token_cs, q_cs
@@ -1691,7 +2352,9 @@ class DexTrader:
                         eth_price_usd = await self.chain.get_eth_price_usd()
                         return price_in_quote / eth_price_usd if eth_price_usd > 0 else 0.0
                     elif True:  # any non-ETH/USDG V4 quote (HOOD/UPS/TTWO/...)
-                        stock_pool = await asyncio.to_thread(self.v3_factory.functions.getPool(q_cs, self.usdg_address, 500).call)
+                        # Walk fee tiers instead of assuming 500 — a miss here used
+                        # to silently fall out of the whole price function and return 0.
+                        stock_pool = await self._resolve_v3_pool(q_cs, self.usdg_address, 500)
                         if stock_pool and stock_pool != ZERO:
                             sp_contract = self.w3.eth.contract(address=stock_pool, abi=[
                                 {'inputs': [], 'name': 'slot0', 'outputs': [{'name': 'sqrtPriceX96', 'type': 'uint160'}, {'name': 'tick', 'type': 'int24'}], 'stateMutability': 'view', 'type': 'function'},
@@ -1707,7 +2370,10 @@ class DexTrader:
                                 return price_usd / eth_price_usd if eth_price_usd > 0 else 0.0
 
             elif venue in ("STOCK_PAIR", "UNISWAP_V3_STOCK"):
-                pool_contract = self.w3.eth.contract(address=target_addr, abi=[
+                pool_addr = await self._resolve_v3_pool(token_cs, quote_asset, fee)
+                if not pool_addr:
+                    raise ValueError(f"no V3 stock pool for {token_cs}/{quote_asset}")
+                pool_contract = self.w3.eth.contract(address=pool_addr, abi=[
                     {'inputs': [], 'name': 'slot0', 'outputs': [{'name': 'sqrtPriceX96', 'type': 'uint160'}, {'name': 'tick', 'type': 'int24'}], 'stateMutability': 'view', 'type': 'function'},
                     {'inputs': [], 'name': 'token0', 'outputs': [{'name': '', 'type': 'address'}], 'stateMutability': 'view', 'type': 'function'},
                     {'inputs': [], 'name': 'token1', 'outputs': [{'name': '', 'type': 'address'}], 'stateMutability': 'view', 'type': 'function'}
@@ -1728,7 +2394,7 @@ class DexTrader:
                     else:
                         price_in_stock = raw_price * (10**dec / 1e18)
 
-                    stock_pool = await asyncio.to_thread(self.v3_factory.functions.getPool(quote_asset, self.usdg_address, 500).call)
+                    stock_pool = await self._resolve_v3_pool(quote_asset, self.usdg_address, 500)
                     if stock_pool and stock_pool != ZERO:
                         sp_contract = self.w3.eth.contract(address=stock_pool, abi=[
                             {'inputs': [], 'name': 'slot0', 'outputs': [{'name': 'sqrtPriceX96', 'type': 'uint160'}, {'name': 'tick', 'type': 'int24'}], 'stateMutability': 'view', 'type': 'function'},
@@ -1771,6 +2437,19 @@ class DexTrader:
 
         except Exception as e:
             logger.debug(f"Error fetching token price in ETH for {token_address}: {e}")
+
+        # The DexScreener fallback is a guess, and a wrong guess here drives the
+        # exit ladder. USDG came back at 0.5582 ETH -- $1403 for a $1 stablecoin.
+        # Only trust it for a token we actually found a venue for; if there is no
+        # tradeable route, a price is meaningless and 0.0 is the safe answer
+        # (position_monitor skips the tick rather than acting on noise).
+        try:
+            venue_now, _t, _q, _f = await self.detect_venue_and_route(token_cs)
+        except Exception:
+            venue_now = "NONE"
+        if venue_now == "NONE":
+            logger.debug(f"No venue for {token_address}; not trusting a DexScreener price")
+            return 0.0
 
         px = await asyncio.to_thread(get_price_eth_dexscreener, token_address)
         if px > 0:
@@ -2035,7 +2714,7 @@ def force_simulate_v4_usdg_2hop(token_address: str, eth_amount: float = 0.0002, 
 
 def get_default_w3_and_account():
     from config import Config
-    from chain_client import ChainClient
+    from chain_client import ChainClient, eip1559_fees
     cfg = Config()
     chain = ChainClient(cfg)
     return chain.w3, chain.account

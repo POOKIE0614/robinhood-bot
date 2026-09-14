@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from enum import Enum
 from typing import Optional, List
@@ -67,6 +67,38 @@ class Position:
     tx_hash_sell: Optional[str] = None
     pnl_usd: Optional[float] = None
     pnl_pct: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        """
+        JSON-safe snapshot for crash recovery. Without this an open position lives
+        only in memory, so a restart leaves the tokens on-chain with no exit ladder
+        and no stop loss.
+        """
+        data = asdict(self)
+        data["status"] = self.status.value
+        for field_name in ("entry_time", "exit_time"):
+            value = data.get(field_name)
+            data[field_name] = value.isoformat() if isinstance(value, datetime) else None
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Position":
+        known = {f.name for f in fields(cls)}
+        kwargs = {k: v for k, v in data.items() if k in known}
+
+        raw_status = kwargs.get("status")
+        try:
+            kwargs["status"] = PositionStatus(raw_status) if raw_status else PositionStatus.OPEN
+        except ValueError:
+            kwargs["status"] = PositionStatus.OPEN
+
+        for field_name in ("entry_time", "exit_time"):
+            value = kwargs.get(field_name)
+            kwargs[field_name] = datetime.fromisoformat(value) if isinstance(value, str) else None
+        if kwargs.get("entry_time") is None:
+            kwargs["entry_time"] = datetime.utcnow()
+
+        return cls(**kwargs)
 
     def close(self, status: PositionStatus, exit_price_eth: float, exit_price_usd: float, tx_hash_sell: str, pnl_usd: float, pnl_pct: float):
         self.status = status

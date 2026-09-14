@@ -1,19 +1,33 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, Callable
+from typing import Dict, Any, Callable, Optional
 from models import Position, PositionStatus
+from trade_ledger import log_event
 
 logger = logging.getLogger("copytrader")
 
 
 class PositionMonitor:
-    def __init__(self, config, dex_trader, chain_client, on_position_closed: Callable[[Position, bool], Any]):
+    def __init__(self, config, dex_trader, chain_client, on_position_closed: Callable[[Position, bool], Any],
+                 on_position_changed: Optional[Callable[[Position], Any]] = None):
         self.config = config
         self.dex_trader = dex_trader
         self.chain_client = chain_client
         self.on_position_closed = on_position_closed
+        # Called after a partial fill so the change reaches disk. Without it a
+        # restart after TP1 would reload the position as untouched and sell that
+        # 40% a second time.
+        self.on_position_changed = on_position_changed
         self._tasks: Dict[str, asyncio.Task] = {}
+
+    def _persist(self, position: Position) -> None:
+        if not self.on_position_changed:
+            return
+        try:
+            self.on_position_changed(position)
+        except Exception as e:
+            logger.error(f"Could not persist position {position.id}: {e}")
 
     async def start_monitoring(self, position: Position):
         if position.id in self._tasks:
@@ -64,8 +78,12 @@ class PositionMonitor:
             stagnant_timeout_mins = int(getattr(self.config, "STAGNANT_TIMEOUT_MINUTES", 25))
             runner_timeout_mins = int(getattr(self.config, "RUNNER_TIMEOUT_MINUTES", 120))
 
-            position.peak_multiplier = 1.0
-            position.trailing_stop_multiplier = sl_target
+            # A resumed position keeps its ratcheted stop. Resetting these to the
+            # initial values would drop a post-TP1 stop from 0.95x back to 0.50x and
+            # hand back profit the ladder had already locked in.
+            position.peak_multiplier = max(1.0, getattr(position, "peak_multiplier", 1.0) or 1.0)
+            if not (getattr(position, "tp1_hit", False) or getattr(position, "tp2_hit", False)):
+                position.trailing_stop_multiplier = sl_target
 
             while True:
                 await asyncio.sleep(getattr(self.config, "PRICE_POLL_SECONDS", 5))
@@ -83,6 +101,7 @@ class PositionMonitor:
                     position.entry_price_eth = current_price_eth
                     position.tokens_bought = position.stake_eth / current_price_eth if current_price_eth > 0 else position.tokens_bought
                     position.remaining_tokens = position.tokens_bought
+                    self._persist(position)
 
                 multiplier = current_price_eth / position.entry_price_eth if position.entry_price_eth > 0 else 1.0
                 if multiplier > 50.0 * max(1.0, position.peak_multiplier):
@@ -140,6 +159,14 @@ class PositionMonitor:
                     position.tp1_pnl_usd = partial_pnl_usd
                     position.accumulated_pnl_usd += partial_pnl_usd
                     position.trailing_stop_multiplier = 0.95
+                    self._persist(position)
+                    log_event(
+                        "tranche_exit", rung="TP1", position_id=position.id,
+                        ticker=position.ticker, contract_address=position.contract_address,
+                        multiplier=multiplier, tokens_sold=sold,
+                        pnl_usd=partial_pnl_usd, remaining_tokens=position.remaining_tokens,
+                        trailing_stop_multiplier=position.trailing_stop_multiplier,
+                    )
                     logger.info(
                         f"✅ TP1 COMPLETED: Sold {sold:,.2f} ${position.ticker} (Secured +${partial_pnl_usd:.2f} profit). "
                         f"Stop-Loss ratcheted to 0.95x. Remaining {position.remaining_tokens:,.2f} tokens riding to {tp2_target:.2f}x!"
@@ -165,6 +192,14 @@ class PositionMonitor:
                     position.tp2_pnl_usd = partial_pnl_usd
                     position.accumulated_pnl_usd += partial_pnl_usd
                     position.trailing_stop_multiplier = 1.20
+                    self._persist(position)
+                    log_event(
+                        "tranche_exit", rung="TP2", position_id=position.id,
+                        ticker=position.ticker, contract_address=position.contract_address,
+                        multiplier=multiplier, tokens_sold=sold,
+                        pnl_usd=partial_pnl_usd, remaining_tokens=position.remaining_tokens,
+                        trailing_stop_multiplier=position.trailing_stop_multiplier,
+                    )
                     logger.info(
                         f"✅ TP2 COMPLETED: Sold {sold:,.2f} ${position.ticker} (Secured +${partial_pnl_usd:.2f} profit). "
                         f"🎉 PRINCIPAL 100% RETURNED TO WALLET! Remaining {position.remaining_tokens:,.2f} (20% Moonbag) riding risk-free to {tp3_target:.2f}x!"

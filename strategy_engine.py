@@ -50,9 +50,22 @@ class StrategyEngine:
                     self.total_pnl_usd = float(data.get("total_pnl_usd", self.total_pnl_usd))
                     state_name = data.get("state", "BASELINE")
                     self.state = StrategyState[state_name] if state_name in StrategyState.__members__ else StrategyState.BASELINE
+
+                    # Open positions survive a restart. They are NOT resumed here --
+                    # main.py reconciles each one against its real on-chain balance
+                    # before monitoring restarts, because this file is a snapshot and
+                    # the chain is the authority on what is actually still held.
+                    self.open_positions = []
+                    for raw in data.get("open_positions", []):
+                        try:
+                            self.open_positions.append(Position.from_dict(raw))
+                        except Exception as e:
+                            logger.error(f"Could not restore a persisted position ({e}); skipping: {raw}")
+
                     logger.info(
                         f"💾 Restored persistent state: Balance=${self.balance_usd:.2f} | "
-                        f"State={self.state.name} | Trades={self.total_trades} (W:{self.wins} L:{self.losses})"
+                        f"State={self.state.name} | Trades={self.total_trades} (W:{self.wins} L:{self.losses}) | "
+                        f"Open positions carried over: {len(self.open_positions)}"
                     )
         except Exception as e:
             logger.warning(f"Could not load state from {self._state_file}: {e}")
@@ -66,12 +79,23 @@ class StrategyEngine:
                 "losses": self.losses,
                 "total_trades": self.total_trades,
                 "total_pnl_usd": self.total_pnl_usd,
-                "state": self.state.name
+                "state": self.state.name,
+                "open_positions": [p.to_dict() for p in self.open_positions],
             }
-            with open(self._state_file, "w", encoding="utf-8") as f:
+            # Write-then-rename: a crash midway through writing this file used to be
+            # able to truncate it, which would lose the open positions it now holds.
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._state_file)
         except Exception as e:
             logger.warning(f"Could not save state to {self._state_file}: {e}")
+
+    def save(self):
+        """Public save point for callers that mutate a live position (partial fills)."""
+        self._save_state()
 
     def get_trade_decision(self, signal: CallSignal, eth_price_usd: float) -> TradeDecision:
         if self.state == StrategyState.HALTED:
@@ -142,9 +166,11 @@ class StrategyEngine:
 
     def add_position(self, position: Position):
         self.open_positions.append(position)
+        self._save_state()
 
     def remove_position(self, position_id: str):
         self.open_positions = [p for p in self.open_positions if p.id != position_id]
+        self._save_state()
 
     def _check_circuit_breaker(self):
         if self.balance_usd <= self.config.SAFETY_FLOOR_USD:

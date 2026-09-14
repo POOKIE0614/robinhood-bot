@@ -79,6 +79,7 @@ class TelegramListener:
                         events.NewMessage(chats=[channel])
                     )
                     self._handler_registered = True
+                    self._lock_strikes = 0
                     logger.info("Telegram listener active. Listening for EARLY CALL alerts...")
 
                 await self.client.run_until_disconnected()
@@ -100,7 +101,24 @@ class TelegramListener:
                 self._handler_registered = False
                 err_msg = str(e)
                 if "database is locked" in err_msg:
-                    logger.warning("Telegram session database lock detected (likely concurrent instance). Waiting 5s for lock to clear...")
+                    # Telethon keeps its session in a SQLite file that only one
+                    # process can hold. A second copy of the bot (or a leftover
+                    # inspect_channel.py) makes BOTH sit here reconnecting forever,
+                    # silently receiving nothing. Say so instead of looping.
+                    self._lock_strikes = getattr(self, "_lock_strikes", 0) + 1
+                    if self._lock_strikes >= 5:
+                        logger.critical(
+                            "Telegram session has been locked for ~25s. Another process is "
+                            "using robinhood_copy_trader_session.session - most likely a second "
+                            "main.py or an inspect_channel.py still running. Close it and start "
+                            "one instance only; this bot is NOT receiving calls until then."
+                        )
+                        self._lock_strikes = 0
+                    else:
+                        logger.warning(
+                            f"Telegram session locked ({self._lock_strikes}/5) - waiting 5s. "
+                            f"If this repeats, another instance is running."
+                        )
                     await asyncio.sleep(5)
                 else:
                     logger.warning(f"Connection dropped ({e}). Auto-reconnecting in 3 seconds...")
@@ -132,15 +150,43 @@ class TelegramListener:
             buttons = getattr(event.message, 'buttons', None)
             reply_markup = getattr(event.message, 'reply_markup', None)
 
+            # Diagnostic: live events and history reads can populate buttons
+            # differently in Telethon. When every call starts reporting "no contract
+            # address", this says whether the markup arrived at all.
+            try:
+                n_rows = len(buttons) if buttons else 0
+                n_btns = sum(len(r) if isinstance(r, list) else 1 for r in (buttons or []))
+                urls = []
+                for row in (buttons or []):
+                    for b in (row if isinstance(row, list) else [row]):
+                        u = getattr(b, "url", None)
+                        if u:
+                            urls.append(u)
+                logger.info(
+                    f"msg {message_id}: buttons={'yes' if buttons else 'NO'} "
+                    f"rows={n_rows} btns={n_btns} urls={len(urls)} "
+                    f"reply_markup={'yes' if reply_markup else 'NO'} "
+                    f"entities={len(entities) if entities else 0} "
+                    f"text_has_0x={'yes' if '0x' in (text or '') else 'no'}"
+                )
+                for u in urls[:5]:
+                    logger.info(f"    button url: {u}")
+            except Exception as diag_err:
+                logger.warning(f"button diagnostic failed: {diag_err}")
+
             logger.debug(f"Received message {message_id} from channel.")
             
-            signal = self.parser.parse(
-                text=text,
-                entities=entities,
-                message_id=message_id,
-                timestamp=timestamp,
-                buttons=buttons,
-                reply_markup=reply_markup
+            # parse() can make a blocking DexScreener lookup when the message has no
+            # contract address. Run it off the event loop, or that http call freezes
+            # every open position's 2-second price monitor while it waits.
+            signal = await asyncio.to_thread(
+                self.parser.parse,
+                text,
+                entities,
+                message_id,
+                timestamp,
+                buttons,
+                reply_markup,
             )
             
             if signal:

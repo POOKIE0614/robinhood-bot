@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import logging
 import time
 from typing import Dict, Any, Optional, List
@@ -17,11 +18,44 @@ ERC20_ABI = [
 ]
 
 DEFAULT_RPCS = [
-    "https://silent-clean-tent.robinhood-mainnet.quiknode.pro/fb9742dcdbac8e3afbacc17fc8859e433a719aa1/",
-    "https://robinhood-rpc.publicnode.com",
+        "https://robinhood-rpc.publicnode.com",
     "https://4663.rpc.thirdweb.com",
     "https://rpc.mainnet.chain.robinhood.com",
 ]
+
+
+def eip1559_fees(w3, headroom: float = 2.0) -> tuple:
+    """
+    (maxFeePerGas, maxPriorityFeePerGas) for chain 4663, priced off the latest block.
+
+    maxFeePerGas is a CEILING, not a price. Measured on five live transactions, the
+    receipt's effectiveGasPrice came back EXACTLY equal to that block's base fee
+    every time -- the priority tip was neither charged nor needed, because blocks on
+    this chain run 0% full. So raising the ceiling costs nothing and buys tolerance.
+
+    Headroom has to be generous here because this chain's base fee only ever climbs:
+    empty blocks still drift it up ~0.3% each instead of decaying it 12.5% the way a
+    standard EIP-1559 chain would. A 1.25x ceiling computed before simulation was
+    being overtaken before the transaction reached the mempool, and TP1 sells died
+    with "max fee per gas less than block base fee" -- profit-taking silently did
+    not fire. 2x is the EIP-1559 default for good reason.
+
+    Sync on purpose: callers in stock_v4_routes.py are sync, and the async ones
+    wrap it in asyncio.to_thread.
+    """
+    base = None
+    try:
+        base = w3.eth.get_block("latest").get("baseFeePerGas")
+    except Exception:
+        pass
+    if not base:
+        try:
+            base = w3.eth.gas_price
+        except Exception:
+            base = w3.to_wei(0.5, "gwei")
+    base = int(base)
+    priority = max(int(base * 0.1), 1_000_000)
+    return int(base * headroom) + priority, priority
 
 
 class ChainClient:
@@ -43,11 +77,21 @@ class ChainClient:
         self._ensure_connected()
         self.fallback_rpc = self.rpc_pool[min(1, len(self.rpc_pool) - 1)]
         self.fallback_w3 = self.w3
-        self.account = (
-            self.w3.eth.account.from_key(self.config.PRIVATE_KEY)
-            if hasattr(self.config, "PRIVATE_KEY") and self.config.PRIVATE_KEY
-            else None
-        )
+        # A malformed key must not take down read-only work. Diagnostics like
+        # inspect_channel.py and verify_encoders.py tiers 0-2 never sign anything,
+        # so they should still run; config.validate() is what refuses to go live
+        # without a usable key.
+        self.account = None
+        raw_key = getattr(self.config, "PRIVATE_KEY", "") or ""
+        if raw_key:
+            try:
+                self.account = self.w3.eth.account.from_key(raw_key)
+            except Exception as e:
+                logger.error(
+                    f"PRIVATE_KEY in .env is not a valid key ({e}). Expected 0x + 64 hex "
+                    f"characters (66 total), got {len(raw_key)}. Continuing WITHOUT a "
+                    f"wallet - read-only calls work, nothing can be signed or sent."
+                )
         self._eth_price_usd: Optional[float] = None
         self._eth_price_timestamp: float = 0
         self._price_cache_ttl = 60
@@ -111,6 +155,21 @@ class ChainClient:
         except Exception as e:
             logger.warning(f"Could not fetch live on-chain balance ({e}), using 0.0 so startup can continue")
             return 0.0
+
+    async def get_token_balance_raw(self, token_address: str) -> int:
+        """
+        Balance in the token's own base units, no float in the path.
+
+        get_token_balance() divides by 10**decimals and returns a float, which keeps
+        ~16 significant digits. An 18-decimal balance has 22, so converting back to
+        raw for a swap silently leaves the remainder behind -- a "sell 100%" exit
+        that strands dust and keeps the position looking open.
+        """
+        if not self.account:
+            return 0
+        token_address = self.w3.to_checksum_address(token_address)
+        contract = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+        return int(await self._retry(contract.functions.balanceOf(self.account.address).call))
 
     async def get_token_balance(self, token_address: str) -> float:
         if not self.account:
@@ -181,24 +240,19 @@ class ChainClient:
         if "chainId" not in tx:
             tx["chainId"] = 4663
 
-        gas_mult = float(getattr(self.config, "GAS_MULTIPLIER", 1.3))
-        if "maxFeePerGas" not in tx and "gasPrice" not in tx:
-            try:
-                latest_block = await self._retry(self.w3.eth.get_block, "latest")
-                base_fee = latest_block.get("baseFeePerGas", None)
-                if base_fee:
-                    max_priority = int(base_fee * 0.1) or self.w3.to_wei(0.01, "gwei")
-                    max_fee = int(base_fee * max(1.3, gas_mult)) + max_priority
-                    tx["maxFeePerGas"] = max_fee
-                    tx["maxPriorityFeePerGas"] = max_priority
-                else:
-                    raw_gp = await self._retry(lambda: self.w3.eth.gas_price)
-                    tx["gasPrice"] = int(raw_gp * max(1.3, gas_mult))
-            except Exception:
-                raw_gp = await self._retry(lambda: self.w3.eth.gas_price)
-                tx["gasPrice"] = int(raw_gp * max(1.3, gas_mult))
-        elif "gasPrice" in tx:
-            tx["gasPrice"] = int(tx["gasPrice"] * max(1.3, gas_mult))
+        # Re-price here, ALWAYS, overwriting whatever the caller set. This block used
+        # to be skipped whenever maxFeePerGas was already present -- which every
+        # caller in dex_trader.py and stock_v4_routes.py sets before simulating. The
+        # good, late, config-aware path was therefore dead code on every real trade,
+        # and the price that actually shipped was one computed before an
+        # eth_estimateGas round trip that can take seconds under RPC throttling.
+        # Signing is the last safe moment to price a transaction, so price it here.
+        if "gasPrice" not in tx:
+            headroom = max(2.0, float(getattr(self.config, "GAS_MULTIPLIER", 1.3)))
+            max_fee, priority = await asyncio.to_thread(
+                eip1559_fees, self.w3, headroom)
+            tx["maxFeePerGas"] = max_fee
+            tx["maxPriorityFeePerGas"] = priority
 
         signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.account.key)
         raw_tx_bytes = getattr(signed_tx, "raw_transaction", getattr(signed_tx, "rawTransaction", None))

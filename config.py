@@ -28,10 +28,11 @@ class Config:
             pk = "0x" + pk
         self.PRIVATE_KEY: str = pk
 
+        # No keyed endpoint as a default: the URL that used to sit here carried a
+        # live API key in a public repo. Set RPC_URL in .env; this keyless public
+        # node is the fallback.
         self.RPC_URL: str = os.getenv(
-            "RPC_URL",
-            "https://silent-clean-tent.robinhood-mainnet.quiknode.pro/fb9742dcdbac8e3afbacc17fc8859e433a719aa1/",
-        )
+            "RPC_URL", "https://robinhood-rpc.publicnode.com")
         self.RPC_WSS_URL: str = os.getenv("RPC_WSS_URL", "")
         self.FALLBACK_RPC_URL: str = os.getenv("FALLBACK_RPC_URL", "https://robinhood-rpc.publicnode.com")
         self.EXTRA_RPC_URLS: str = os.getenv("EXTRA_RPC_URLS", "https://4663.rpc.thirdweb.com")
@@ -67,6 +68,17 @@ class Config:
         self.GAS_MULTIPLIER: float = float(os.getenv("GAS_MULTIPLIER", "1.3"))
         self.FAST_EXECUTION_MODE: bool = str(os.getenv("FAST_EXECUTION_MODE", "true")).lower() == "true"
         self.BUY_EVERY_SIGNAL: bool = str(os.getenv("BUY_EVERY_SIGNAL", "true")).lower() == "true"
+        # Resolving a contract address from the TICKER is unsafe on this chain:
+        # a live search for "ROACH" returns 6 different tokens, and the most
+        # liquid one is not the one that was called. Anyone can mint a clone of
+        # a ticker, which is exactly how a honeypot gets bought. Off by default;
+        # the contract address should come from the call message's buttons.
+        # Tokens held deliberately (e.g. USDG kept as swap liquidity). status.py
+        # will not flag these as stranded. Comma-separated addresses.
+        self.RESERVED_TOKENS: set = {
+            a.strip().lower() for a in os.getenv("RESERVED_TOKENS", "").split(",") if a.strip()
+        }
+        self.ALLOW_TICKER_FALLBACK: bool = str(os.getenv("ALLOW_TICKER_FALLBACK", "false")).lower() == "true"
         self.BASE_DIR = str(_BASE_DIR)
         self.ENV_PATH = str(_ENV_PATH)
 
