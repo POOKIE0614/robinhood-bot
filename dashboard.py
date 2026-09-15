@@ -2,7 +2,8 @@
 """
 Everything the bot is doing, on one page.
 
-    python dashboard.py             # live at http://127.0.0.1:8787, refreshes itself
+    python dashboard.py             # live at http://127.0.0.1:8787, this machine only
+    python dashboard.py --share     # reachable off-machine, password required
     python dashboard.py --snapshot  # writes dashboard.html, self-contained
 
 Read-only. It parses logs and reads the state file; it never sends a transaction
@@ -12,14 +13,20 @@ buy failures were detection timeouts with a 429 alongside them -- so a dashboard
 that polled it for live prices would cost real trades. Open-position state comes
 from the "Tracking $X: Multiplier" line the bot already writes.
 """
+import base64
+import hmac
 import json
 import os
 import re
+import secrets
 import sys
+import threading
+import time
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from dashboard_data import collect, log_files
+from dashboard_data import collect, bot_process, source_stamp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 8787
@@ -128,7 +135,8 @@ let LAST_SIG = null;
 // rebuild the DOM -- doing that every 5s threw away the reader's scroll position
 // mid-table. Re-render only when something that is actually ON the page moved.
 const signature = (d) => JSON.stringify([
-  d.days, d.totals, d.bot, d.open_positions,
+  (d.generated_at || '').slice(0, 10),
+  d.days, d.totals, d.bot, d.open_positions, d.entry_budget, d.activity,
   (d.trades || []).length, (d.swaps || []).length,
   (d.signals || []).length, (d.rejections || []).length, (d.errors || []).length,
 ]);
@@ -144,13 +152,13 @@ function render(d) {
   document.getElementById('sub').textContent =
     `generated ${d.generated_at} · ${d.ledger_events} ledger events · code ${d.code_version || 'unknown'}`;
   const st = document.getElementById('status');
-  const on = d.bot && d.bot.running;
-  st.className = 'pill ' + (on ? 'on' : 'off');
-  st.innerHTML = `<span class="dot"></span>${on ? 'Bot running' : 'Bot not running'}`;
+  const on = d.bot?.running;
+  st.className = 'pill ' + (on === true ? 'on' : on === false ? 'off' : '');
+  st.innerHTML = `<span class="dot" aria-hidden="true"></span>${on === true ? 'Bot process running' : on === false ? 'Bot not running' : 'Bot status unavailable'}`;
 
-  const days = Object.keys(d.days);
-  const today = days.length ? d.days[days[days.length - 1]] : {};
-  const label = days.length ? days[days.length - 1] : '—';
+  const label = (d.generated_at || '').slice(0, 10);
+  const days = Object.keys(d.days || {});
+  const today = (d.days || {})[label] || {};
   const t = d.totals || {};
   const out = [];
 
@@ -169,21 +177,35 @@ function render(d) {
     <p class="note">Lifetime, from the bot's own state file:
       <b>${t.total_trades ?? 0}</b> trades, <b>${t.wins ?? 0}W / ${t.losses ?? 0}L</b>,
       <b class="${cls(t.total_pnl_usd)}">${usd(t.total_pnl_usd)}</b>,
-      balance <b>$${Number(t.balance_usd || 0).toFixed(2)}</b> · state ${esc(t.state || '—')}.
-      P&amp;L is <b>gross</b> — actual gas per trade is not recorded, only the pre-flight estimate.</p>
+      saved strategy balance <b>$${Number(t.balance_usd || 0).toFixed(2)}</b> · state ${esc(t.state || '—')}.
+      This is bookkeeping, not a live wallet valuation. Historical P&amp;L includes estimates;
+      newer trades record receipt gas and their cost basis.</p>
   </section>`);
 
-  const blocked = (d.rejections || []).slice(-12)
-    .filter(r => /balance above floor/i.test(r.reason || ''));
-  if (blocked.length || (t.state || '').toUpperCase() === 'HALTED') {
-    const last = blocked[blocked.length - 1];
-    out.push(`<div class="alert"><b>Trading is blocked — the bot is running but taking nothing.</b>
-      <p>Balance is <b>$${Number(t.balance_usd || 0).toFixed(2)}</b> and the safety floor is
-      <b>$${Number(d.safety_floor || 0).toFixed(2)}</b>, so the next stake would breach it.
-      ${blocked.length} of the last 12 calls were refused for this reason${
-        last ? `, most recently at ${esc(last.day)} ${esc(last.time)}` : ''}.
-      Raise the floor, add funds, or accept that it has stopped.</p></div>`);
+  const budget = d.entry_budget || {};
+  const activity = d.activity || {};
+  if (budget.known && (budget.below_requirement || budget.halted)) {
+    out.push(`<div class="alert" role="status"><b>${budget.halted ? 'Strategy is halted.' : 'Entry budget is below the configured requirement.'}</b>
+      <p>Based on saved strategy state and configured limits:
+      $${budget.safety_floor_usd.toFixed(2)} floor + $${budget.next_stake_usd.toFixed(2)} next stake +
+      $${budget.gas_reserve_usd.toFixed(2)} gas reserve + $${budget.reserved_stake_usd.toFixed(2)} reserved for open positions
+      = <b>$${budget.required_balance_usd.toFixed(2)} required</b>.
+      Saved strategy balance: <b>$${budget.balance_usd.toFixed(2)}</b>${budget.below_requirement ?
+        `; shortfall: <b>$${budget.shortfall_usd.toFixed(2)}</b>` : ''}.
+      Raising the floor increases the required balance. Stock reuse does not bypass this budget check.
+      ${budget.halted ? 'The halted state also prevents new entries.' : ''}</p></div>`);
   }
+  out.push(`<section><span class="eyebrow">Process and recorded activity</span><h2>Current session</h2>
+    <p class="note">Last recorded activity: <b>${esc(activity.last_activity_at || 'unavailable')}</b>.
+      ${activity.started_at ? `Started ${esc(activity.started_at)} · ${activity.session_signal_evaluations} signal evaluations ·
+        ${activity.session_floor_refusals} floor refusals since startup.` : 'Startup time unavailable.'}</p>
+    <p class="note">${activity.native_wallet_usd != null ?
+      `Last logged native ETH balance: <b>$${Number(activity.native_wallet_usd).toFixed(2)}</b> at ${esc(activity.native_wallet_at)}.
+       This excludes stock tokens and has not been refreshed on-chain by the dashboard.` :
+      'No native wallet balance recorded.'}</p>
+    ${activity.last_floor_refusal_at ? `<p class="note">Most recent recorded floor refusal:
+      ${esc(activity.last_floor_refusal_at)}. Historical refusals do not establish that a new call was rejected.</p>` : ''}
+  </section>`);
 
   const open = d.open_positions || [];
   out.push(`<section><span class="eyebrow">Live</span><h2>Open positions</h2>
@@ -290,7 +312,7 @@ function render(d) {
     b.addEventListener('click', () => { FEED_FILTER = b.dataset.f; LAST_SIG = null; render(d); }));
   document.getElementById('foot').innerHTML =
     `Read-only. Parses logs/bot.log* and logs/events.jsonl; no RPC calls, no transactions.<br>` +
-    `P&amp;L is gross of gas — only the pre-flight gas estimate is logged, not actual gas used.`;
+    `Historical returns include estimates; newer entries record receipt gas and their cost basis.`;
 }
 
 function buildFeed(d) {
@@ -324,7 +346,10 @@ async function boot() {
       LAST_SIG = sig;
       render(d);
     }
-    catch (e) { document.getElementById('sub').textContent = 'lost contact with dashboard.py'; }
+    catch (e) {
+      document.getElementById('sub').textContent = 'Dashboard refresh failed';
+      console.error('Dashboard refresh failed', e);
+    }
   };
   await tick();
   setInterval(tick, 5000);
@@ -334,8 +359,46 @@ boot();
 """
 
 
+# Set only by --share. None means loopback-only, where a password buys nothing.
+AUTH = None
+
+
 class Handler(BaseHTTPRequestHandler):
     _cache = {"stamp": None, "data": None}
+    _process_cache = {"checked": None, "data": None}
+    _cache_lock = threading.Lock()
+
+    @classmethod
+    def current_data(cls):
+        with cls._cache_lock:
+            stamp = source_stamp()
+            if stamp != cls._cache["stamp"]:
+                cls._cache = {"stamp": stamp, "data": collect(check_process=False)}
+            now = time.monotonic()
+            if cls._process_cache["checked"] is None or now - cls._process_cache["checked"] >= 10:
+                cls._process_cache = {"checked": now, "data": bot_process()}
+            # A stopped bot cannot change its log mtime. Refresh process status
+            # independently, without re-reading all historical logs every poll.
+            return {**cls._cache["data"], "bot": cls._process_cache["data"],
+                    "generated_at": datetime.now().isoformat(timespec="seconds")}
+
+    def _authorised(self) -> bool:
+        """HTTP Basic, compared in constant time."""
+        if AUTH is None:
+            return True
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Basic "):
+            try:
+                supplied = base64.b64decode(header[6:]).decode("utf-8")
+            except Exception:
+                supplied = ""
+            if hmac.compare_digest(supplied, AUTH):
+                return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="bot dashboard"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
 
     def _send(self, body: bytes, ctype: str):
         self.send_response(200)
@@ -345,13 +408,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._authorised():
+            return
         if self.path.startswith("/data.json"):
             # Re-parse only when a log file actually changed. bot.log.1 alone is
             # 5MB; re-reading it every 5 seconds would burn CPU for nothing.
-            stamp = tuple(os.path.getmtime(p) for p in log_files())
-            if stamp != Handler._cache["stamp"]:
-                Handler._cache = {"stamp": stamp, "data": collect()}
-            body = json.dumps(Handler._cache["data"], default=str, ensure_ascii=False)
+            body = json.dumps(self.current_data(), default=str, ensure_ascii=False)
             return self._send(body.encode("utf-8"), "application/json; charset=utf-8")
         self._send(PAGE.replace("__DATA__", "null").encode("utf-8"),
                    "text/html; charset=utf-8")
@@ -390,13 +452,25 @@ if __name__ == "__main__":
         snapshot()
         snapshot(for_artifact=True)
     else:
+        # Loopback by default. --share is an explicit, password-gated opt-in: this
+        # page shows a wallet address, balances, open positions and P&L, so it must
+        # never be reachable off-machine without a password.
+        share = "--share" in sys.argv
+        if share:
+            password = next((a.split("=", 1)[1] for a in sys.argv
+                             if a.startswith("--password=")), "") or secrets.token_urlsafe(9)
+            globals()["AUTH"] = f"watch:{password}"
+            print("SHARE MODE - reachable from the network, password required\n")
+            print(f"   username  watch")
+            print(f"   password  {password}\n")
+            print("   Send the password separately from the link, and stop the")
+            print("   server (ctrl+c) once your friend is done looking.\n")
         url = f"http://127.0.0.1:{PORT}"
         print(f"dashboard on {url}   (ctrl+c to stop)")
-        if "--no-open" not in sys.argv:
+        if "--no-open" not in sys.argv and not share:
             webbrowser.open(url)
-        # 127.0.0.1, not 0.0.0.0: this exposes wallet and position data and has no
-        # auth, so it must not be reachable from the network.
         try:
-            ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+            ThreadingHTTPServer(("0.0.0.0" if share else "127.0.0.1", PORT),
+                                Handler).serve_forever()
         except KeyboardInterrupt:
             print("\nstopped")
